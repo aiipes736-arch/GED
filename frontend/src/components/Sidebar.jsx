@@ -19,7 +19,7 @@ const items = [
   { to: "/", label: "Tableau de bord", icon: LayoutDashboard, exact: true, testId: "nav-dashboard" },
   { to: "/documents", label: "Documents", icon: FileText, testId: "nav-documents" },
   { to: "/folders", label: "Dossiers", icon: FolderOpen, testId: "nav-folders" },
-  { to: "/archive", label: "Archives", icon: Archive, testId: "nav-archive" },
+  { to: "/archive", label: "Archives", icon: Archive, testId: "nav-archives" },
   { to: "/activity", label: "Journal d'activité", icon: History, testId: "nav-activity" },
   { to: "/agents", label: "Agents", icon: Users, adminOnly: true, testId: "nav-agents" },
 ];
