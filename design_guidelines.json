@@ -1,0 +1,97 @@
+{
+  "project_name": "MHCGED",
+  "domain": "Government/Institutional Document Management System (GED)",
+  "theme": "light",
+  "archetype": "4 - Swiss & High-Contrast",
+  "mood": "Formal, Official, Trustworthy, Secure, Dense but clear",
+  "typography": {
+    "fonts": {
+      "heading": "Work Sans",
+      "body": "IBM Plex Sans"
+    },
+    "hierarchy": {
+      "h1": "text-3xl sm:text-4xl lg:text-5xl font-bold tracking-tight text-gray-900",
+      "h2": "text-2xl sm:text-3xl font-semibold tracking-tight text-gray-800",
+      "h3": "text-xl sm:text-2xl font-medium tracking-tight text-gray-800",
+      "h4": "text-lg font-medium text-gray-800",
+      "body": "text-sm sm:text-base leading-relaxed text-gray-600",
+      "small": "text-xs font-medium uppercase tracking-[0.2em] text-gray-500"
+    }
+  },
+  "colors": {
+    "primary": {
+      "DEFAULT": "#0F4C3A",
+      "light": "#1A6B53",
+      "dark": "#083325",
+      "foreground": "#FFFFFF"
+    },
+    "secondary": {
+      "DEFAULT": "#FCD116",
+      "foreground": "#0F4C3A"
+    },
+    "accent": {
+      "DEFAULT": "#DC241F",
+      "foreground": "#FFFFFF"
+    },
+    "background": "#F9FAFB",
+    "surface": "#FFFFFF",
+    "border": "#E5E7EB",
+    "text": {
+      "main": "#111827",
+      "muted": "#4B5563"
+    },
+    "sidebar": {
+      "background": "#FFFFFF",
+      "active_bg": "#F0FDF4",
+      "active_text": "#0F4C3A",
+      "border": "#E5E7EB"
+    }
+  },
+  "layout_and_spacing": {
+    "spacing_scale": "p-2, p-4, p-6, p-8, p-12",
+    "container_padding": "p-6 sm:p-8",
+    "grid": {
+      "dashboard": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6",
+      "forms": "grid-cols-1 md:grid-cols-2 gap-6"
+    },
+    "borders": "rounded-lg border border-gray-200",
+    "shadows": "shadow-sm"
+  },
+  "components_strategy": {
+    "buttons": "Solid backgrounds for primary actions with hover:bg-primary-light. Rounded-md, font-medium, focus-visible:ring-2 focus-visible:ring-primary/50.",
+    "cards": "Flat background (bg-white), 1px solid border (border-gray-200), no heavy shadow. Minimalist and structured.",
+    "tables": "Dense rows, left-aligned columns, alternating row backgrounds (optional) for readability, clear status badges (e.g., Active/Archived).",
+    "modals": "Backdrop blur (backdrop-blur-sm bg-black/40), solid white dialog, strict padding (p-6).",
+    "badges": "Subtle background with bold text. e.g., bg-green-100 text-green-800 for Active, bg-red-100 text-red-800 for Archived."
+  },
+  "motion_and_interactions": {
+    "hover": "Subtle background shifts, transform scale (e.g., scale-105 for icons), explicitly set hover text color.",
+    "focus": "High contrast focus rings (ring-2 ring-primary ring-offset-2).",
+    "transitions": "transition-colors duration-200 ease-in-out"
+  },
+  "icons": {
+    "library": "lucide-react",
+    "style": "stroke-2, crisp, functional."
+  },
+  "media": {
+    "logo": {
+      "url": "https://customer-assets.emergentagent.com/job_ada3efd6-4e4c-4295-902b-4abf286154c2/artifacts/dmk2iip2_Photo%201.jpeg",
+      "description": "Armoiries officielles République du Congo, to be used as favicon and header logo."
+    },
+    "hero_login": {
+      "url": "https://customer-assets.emergentagent.com/job_ada3efd6-4e4c-4295-902b-4abf286154c2/artifacts/15pprz55_Photo%202.jpeg",
+      "description": "Drapeau du Congo + logo Ministère des Hydrocarbures, fond vert institutionnel, to be used as login page hero background image."
+    }
+  },
+  "specific_instructions_to_main_agent": [
+    "Build a Professional GED (MHCGED) with a sidebar layout and top header.",
+    "Login page MUST use the 'hero_login' image as a side panel or background with a max overlay opacity of bg-black/50, and display the 'logo' above the login form.",
+    "The application language MUST be French.",
+    "Use deep institutional green (#0F4C3A) as the primary brand color for active states, CTAs, and sidebar highlights.",
+    "Implement role-based access control UI (Admin vs Agent).",
+    "Dashboard should display key metrics: Total Documents, Active Folders, Total Agents, Archived Documents.",
+    "Use data-testid attributes on all interactive elements (buttons, inputs, links).",
+    "Do NOT use 'Inter' font. Use 'Work Sans' for headings and 'IBM Plex Sans' for body.",
+    "Use Shadcn UI components for complex interactions like Modals (Dialog), Dropdowns, Tables, and Forms."
+  ]
+}
