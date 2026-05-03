@@ -1,0 +1,50 @@
+{
+  "summary": "Iteration 3 frontend-only retest after Folders.jsx Babel fix. Frontend now compiles. Notifications bell (notif-bell, notif-dropdown) and Folders hierarchy (new-folder-btn, folder-parent dropdown, folder-submit, folder-add-child-{id}, chevron expand/collapse) all work end-to-end. Admin password-reset flow on Agents page is BROKEN: the 'Changer mot de passe' dropdown item is wired to open the edit dialog instead of the reset dialog, and the required data-testid 'agent-reset-{id}' is missing entirely. The reset dialog (reset-password-input / reset-password-confirm / reset-password-submit) is defined but unreachable from the UI.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "Agents.jsx",
+        "issue": "Admin password reset dialog is unreachable. The 'Changer mot de passe' DropdownMenuItem (lines 194-196) calls `setEdit(u); setForm(...); setOpen(true)` which opens the edit-agent dialog, not the reset dialog. setResetTarget(u) is never invoked from any menu item, so the reset dialog (<Dialog open={!!resetTarget}>) will never show. Also, required data-testid `agent-reset-{u.id}` is missing on that menu item.",
+        "selector": "[data-testid='agent-reset-{id}']",
+        "priority": "HIGH"
+      }
+    ],
+    "integration_issues": [
+      {
+        "flow": "Admin password reset",
+        "issue": "Since the reset dialog never opens, reset-password-input, reset-password-confirm, reset-password-submit are never rendered. The backend endpoint POST /api/users/{id}/reset-password (verified green in iteration 2) is therefore never called from the UI.",
+        "affected_selectors": ["agent-reset-{id}", "reset-password-input", "reset-password-confirm", "reset-password-submit"]
+      }
+    ],
+    "design_issues": [
+      {
+        "screen": "Agents page - create agent form",
+        "issues": ["Email field rejects RFC-reserved TLDs such as .local with '@-sign is a special-use or reserved name' (server-side email-validator). Not a bug in the feature under test, but blocks QA test emails; consider allowing reserved TLDs in dev or documenting the constraint."]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/test_reports/pytest/pytest_new_features.xml"
+  ],
+  "action_items": [
+    "Agents.jsx (lines 194-196): change the 'Changer mot de passe' DropdownMenuItem onClick from `{ setEdit(u); setForm({...}); setOpen(true); }` to `setResetTarget(u)` and add `data-testid={`agent-reset-${u.id}`}`. After fix, the reset dialog will open with reset-password-input / reset-password-confirm / reset-password-submit already wired correctly (submitReset handler already validates length<6 and confirmation mismatch client-side and calls POST /users/{id}/reset-password).",
+    "Optional: also consider adding a `data-testid` on the existing kebab MoreVertical button in each agent row so automated tests can reliably open the per-row action menu (currently only discoverable via svg class)."
+  ],
+  "critical_code_review_comments": [
+    "Agents.jsx: two DropdownMenuItem entries (Modifier + Changer mot de passe) currently share identical onClick handlers - only the label/icon differs. This is a clear copy-paste bug that removes the entire admin-reset feature from the UI despite the backend and dialog being fully implemented.",
+    "Agents.jsx: submitReset does not re-enable the submit button on failure (toast fires but form stays). Minor UX.",
+    "Folders.jsx: flattenTree fix works great - verified root/child creation, chevron toggles, and collapse hide children. Performance is fine for small trees; if folders grow >1000, consider indexing children map once rather than rebuilding on each render (useMemo is already used - acceptable for now).",
+    "Header.jsx: notif-mark-all is only rendered when unread_count>0 which matches the spec; clicking a notif item marks read and refetches - good. Polls every 30s which is fine.",
+    "server.py deprecated @app.on_event startup/shutdown (flagged in iteration 1 + 2, still not fixed)."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (not retested - was 28/28 in iteration 2)", "frontend": "66% (notifications ✓, folders ✓, password-reset ✗)"},
+  "test_credentials": "admin@mhcged.cg / Admin@2026 (confirmed working)",
+  "seed_data_creation": "Created UITEST_Root_<ts> and UITEST_Child_<ts> folders during folder test (visible in screenshots). Attempted to create a uitest_reset_<ts>@test.local agent - rejected by email validator. No residual UITEST_ users.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "After main agent fixes Agents.jsx line 194-196 (wire onClick to setResetTarget(u) and add data-testid='agent-reset-{u.id}'), retest: (1) create a non-admin test agent using a real TLD email like uitest_<ts>@example.com (NOT .local, which the email-validator rejects), (2) open kebab menu on that row, (3) click [data-testid='agent-reset-{id}'], verify reset dialog opens with reset-password-input/confirm/submit, (4) submit a 3-char password and verify toast 'Mot de passe trop court', (5) submit mismatched passwords and verify toast 'Les deux mots de passe ne correspondent pas', (6) submit valid matching 8+ char password and verify success toast and dialog close. Notifications and Folders flows are fully green and don't need retest. Backend /api/users/{id}/reset-password was 100% green in iteration 2.",
+  "rca_of_the_issue": "In Agents.jsx the reset-password feature was only half-wired. The state (`resetTarget`, `resetPwd`, `resetPwd2`), the submit handler (`submitReset` - correctly POSTs /users/{id}/reset-password), and the dialog with all three testids (reset-password-input, reset-password-confirm, reset-password-submit) are all present. However, the per-row DropdownMenuItem that should trigger `setResetTarget(u)` was copy-pasted from the 'Modifier' item and retains the same onClick that opens the edit dialog (`setEdit(u); setOpen(true)`). As a result the reset dialog is defined but never opens, and the required `agent-reset-{u.id}` data-testid is absent. Mitigation: a one-line change to that onClick plus adding the testid attribute makes the feature fully functional end-to-end (backend is already green)."
+}

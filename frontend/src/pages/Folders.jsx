@@ -11,94 +11,27 @@ import {
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { FolderOpen, Plus, Pencil, Trash2, ChevronRight, ChevronDown, Folder } from "lucide-react";
 
-function buildTree(folders) {
-  const byId = new Map(folders.map((f) => [f.id, { ...f, children: [] }]));
-  const roots = [];
-  byId.forEach((f) => {
-    if (f.parent_id && byId.has(f.parent_id)) {
-      byId.get(f.parent_id).children.push(f);
-    } else {
-      roots.push(f);
+// Flatten folders into a list of {folder, depth, hasChildren} respecting expand state
+function flattenTree(folders, expanded) {
+  const childrenByParent = new Map();
+  for (const f of folders) {
+    const key = f.parent_id || "__root__";
+    if (!childrenByParent.has(key)) childrenByParent.set(key, []);
+    childrenByParent.get(key).push(f);
+  }
+  const out = [];
+  const walk = (parentKey, depth) => {
+    const list = childrenByParent.get(parentKey) || [];
+    for (const node of list) {
+      const hasChildren = (childrenByParent.get(node.id) || []).length > 0;
+      out.push({ folder: node, depth, hasChildren });
+      if (hasChildren && expanded.has(node.id)) {
+        walk(node.id, depth + 1);
+      }
     }
-  });
-  return roots;
-}
-
-function FolderRow({ node, depth, onEdit, onDelete, onAddChild, expanded, toggle }) {
-  const isOpen = expanded.has(node.id);
-  const hasChildren = node.children.length > 0;
-  return (
-    <>
-      <div
-        className="flex items-center gap-2 py-2.5 px-3 rounded-md hover:bg-gray-50 group border-b border-gray-100 last:border-0"
-        style={{ paddingLeft: 12 + depth * 22 }}
-        data-testid={`folder-${node.id}`}
-      >
-        <button
-          onClick={() => hasChildren && toggle(node.id)}
-          className={`w-5 h-5 flex items-center justify-center text-gray-400 ${
-            hasChildren ? "hover:text-gray-700" : "invisible"
-          }`}
-          aria-label="toggle"
-        >
-          {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        </button>
-        <div className="w-7 h-7 rounded bg-[#e8f3ed] text-[#0f4c3a] flex items-center justify-center flex-shrink-0">
-          {hasChildren ? <FolderOpen size={14} /> : <Folder size={14} />}
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="font-medium text-gray-900 truncate">{node.name}</div>
-          {node.description && (
-            <div className="text-xs text-gray-500 truncate">{node.description}</div>
-          )}
-        </div>
-        <div className="text-xs text-gray-400 hidden md:block whitespace-nowrap mr-2">
-          {node.created_by_name} · {formatDate(node.created_at)}
-        </div>
-        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <Button
-            size="icon"
-            variant="ghost"
-            onClick={() => onAddChild(node)}
-            title="Ajouter un sous-dossier"
-            data-testid={`folder-add-child-${node.id}`}
-          >
-            <Plus size={14} />
-          </Button>
-          <Button
-            size="icon"
-            variant="ghost"
-            onClick={() => onEdit(node)}
-            data-testid={`folder-edit-${node.id}`}
-          >
-            <Pencil size={14} />
-          </Button>
-          <Button
-            size="icon"
-            variant="ghost"
-            onClick={() => onDelete(node)}
-            className="text-red-600 hover:text-red-700 hover:bg-red-50"
-            data-testid={`folder-delete-${node.id}`}
-          >
-            <Trash2 size={14} />
-          </Button>
-        </div>
-      </div>
-      {isOpen &&
-        node.children.map((c) => (
-          <FolderRow
-            key={c.id}
-            node={c}
-            depth={depth + 1}
-            onEdit={onEdit}
-            onDelete={onDelete}
-            onAddChild={onAddChild}
-            expanded={expanded}
-            toggle={toggle}
-          />
-        ))}
-    </>
-  );
+  };
+  walk("__root__", 0);
+  return out;
 }
 
 export default function Folders() {
@@ -127,7 +60,7 @@ export default function Folders() {
 
   useEffect(() => { load(); }, [load]);
 
-  const tree = useMemo(() => buildTree(folders), [folders]);
+  const flat = useMemo(() => flattenTree(folders, expanded), [folders, expanded]);
 
   const toggle = (id) => {
     setExpanded((prev) => {
@@ -189,7 +122,6 @@ export default function Folders() {
       : `Supprimer le dossier « ${f.name} » ? (les documents ne seront pas supprimés)`;
     if (!window.confirm(msg)) return;
     try {
-      // detach children
       if (childCount) {
         await Promise.all(
           folders
@@ -206,8 +138,9 @@ export default function Folders() {
   };
 
   // Parent options excluding the folder being edited and its descendants
-  const descendantsOf = (id) => {
-    const out = new Set([id]);
+  const blockedIds = useMemo(() => {
+    if (!edit) return new Set();
+    const out = new Set([edit.id]);
     let added = true;
     while (added) {
       added = false;
@@ -219,8 +152,7 @@ export default function Folders() {
       }
     }
     return out;
-  };
-  const blockedIds = edit ? descendantsOf(edit.id) : new Set();
+  }, [edit, folders]);
 
   return (
     <div className="space-y-6" data-testid="folders-page">
@@ -307,18 +239,67 @@ export default function Folders() {
         </div>
       ) : (
         <div className="inst-card p-2">
-          {tree.map((root) => (
-            <FolderRow
-              key={root.id}
-              node={root}
-              depth={0}
-              onEdit={openEdit}
-              onDelete={remove}
-              onAddChild={openCreate}
-              expanded={expanded}
-              toggle={toggle}
-            />
-          ))}
+          {flat.map(({ folder, depth, hasChildren }) => {
+            const isOpen = expanded.has(folder.id);
+            return (
+              <div
+                key={folder.id}
+                className="flex items-center gap-2 py-2.5 px-3 rounded-md hover:bg-gray-50 group border-b border-gray-100 last:border-0"
+                style={{ paddingLeft: 12 + depth * 22 }}
+                data-testid={`folder-${folder.id}`}
+              >
+                <button
+                  onClick={() => hasChildren && toggle(folder.id)}
+                  className={`w-5 h-5 flex items-center justify-center text-gray-400 ${
+                    hasChildren ? "hover:text-gray-700" : "invisible"
+                  }`}
+                  aria-label="toggle"
+                >
+                  {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                </button>
+                <div className="w-7 h-7 rounded bg-[#e8f3ed] text-[#0f4c3a] flex items-center justify-center flex-shrink-0">
+                  {hasChildren ? <FolderOpen size={14} /> : <Folder size={14} />}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium text-gray-900 truncate">{folder.name}</div>
+                  {folder.description && (
+                    <div className="text-xs text-gray-500 truncate">{folder.description}</div>
+                  )}
+                </div>
+                <div className="text-xs text-gray-400 hidden md:block whitespace-nowrap mr-2">
+                  {folder.created_by_name} · {formatDate(folder.created_at)}
+                </div>
+                <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => openCreate(folder)}
+                    title="Ajouter un sous-dossier"
+                    data-testid={`folder-add-child-${folder.id}`}
+                  >
+                    <Plus size={14} />
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => openEdit(folder)}
+                    data-testid={`folder-edit-${folder.id}`}
+                  >
+                    <Pencil size={14} />
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={() => remove(folder)}
+                    className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                    data-testid={`folder-delete-${folder.id}`}
+                  >
+                    <Trash2 size={14} />
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
