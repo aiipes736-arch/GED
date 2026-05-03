@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import api, { formatBytes, formatDate } from "../lib/api";
-import { FileText, FolderOpen, Users, Archive, HardDrive, TrendingUp } from "lucide-react";
+import { FileText, FolderOpen, Users, Archive, HardDrive, TrendingUp, Megaphone } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 
 function StatCard({ icon: Icon, label, value, accent, testId }) {
@@ -22,9 +22,11 @@ function StatCard({ icon: Icon, label, value, accent, testId }) {
 export default function Dashboard() {
   const { user } = useAuth();
   const [stats, setStats] = useState(null);
+  const [announcements, setAnnouncements] = useState([]);
 
   useEffect(() => {
     api.get("/dashboard/stats").then((r) => setStats(r.data)).catch(() => {});
+    api.get("/announcements").then((r) => setAnnouncements(r.data.slice(0, 3))).catch(() => {});
   }, []);
 
   return (
@@ -38,6 +40,28 @@ export default function Dashboard() {
           Aperçu de votre plateforme MHCGED — {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
         </p>
       </div>
+
+      {announcements.length > 0 && (
+        <div className="space-y-3" data-testid="dashboard-announcements">
+          {announcements.map((a) => (
+            <div
+              key={a.id}
+              className="rounded-lg border border-amber-200 bg-amber-50/60 px-4 py-3 flex items-start gap-3"
+            >
+              <div className="w-8 h-8 rounded-md bg-amber-100 text-amber-700 flex items-center justify-center flex-shrink-0">
+                <Megaphone size={16} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-gray-900">{a.title}</div>
+                <p className="text-sm text-gray-700 mt-0.5 whitespace-pre-wrap">{a.content}</p>
+                <div className="text-[11px] text-gray-500 mt-1">
+                  Publié par {a.author_name} · {formatDate(a.created_at)}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
         <StatCard

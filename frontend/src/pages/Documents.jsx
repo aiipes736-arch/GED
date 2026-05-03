@@ -17,7 +17,7 @@ import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
 } from "../components/ui/dropdown-menu";
 import {
-  Upload, Search, FileText, MoreVertical, Download, Trash2, Archive, Pencil, Share2,
+  Upload, Search, FileText, MoreVertical, Download, Trash2, Archive, Pencil, Share2, MessageSquare, Send,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 
@@ -40,6 +40,9 @@ export default function Documents({ archivedView = false }) {
   const [editDoc, setEditDoc] = useState(null);
   const [shareDoc, setShareDoc] = useState(null);
   const [shareSelected, setShareSelected] = useState([]);
+  const [commentsDoc, setCommentsDoc] = useState(null);
+  const [comments, setComments] = useState([]);
+  const [commentDraft, setCommentDraft] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -152,6 +155,39 @@ export default function Documents({ archivedView = false }) {
       await api.post(`/documents/${shareDoc.id}/share`, { user_ids: shareSelected });
       toast.success("Partage mis à jour");
       setShareDoc(null);
+    } catch (e) {
+      toast.error(formatApiError(e.response?.data?.detail));
+    }
+  };
+
+  const openComments = async (d) => {
+    setCommentsDoc(d);
+    setCommentDraft("");
+    try {
+      const { data } = await api.get(`/documents/${d.id}/comments`);
+      setComments(data);
+    } catch (e) {
+      toast.error(formatApiError(e.response?.data?.detail));
+    }
+  };
+
+  const sendComment = async (e) => {
+    e?.preventDefault?.();
+    if (!commentDraft.trim()) return;
+    try {
+      await api.post(`/documents/${commentsDoc.id}/comments`, { content: commentDraft });
+      setCommentDraft("");
+      const { data } = await api.get(`/documents/${commentsDoc.id}/comments`);
+      setComments(data);
+    } catch (e) {
+      toast.error(formatApiError(e.response?.data?.detail));
+    }
+  };
+
+  const removeComment = async (cid) => {
+    try {
+      await api.delete(`/comments/${cid}`);
+      setComments(comments.filter((c) => c.id !== cid));
     } catch (e) {
       toast.error(formatApiError(e.response?.data?.detail));
     }
@@ -291,6 +327,7 @@ export default function Documents({ archivedView = false }) {
                     <DropdownMenuContent align="end">
                       <DropdownMenuItem onClick={() => downloadDoc(d)} data-testid={`download-${d.id}`}><Download size={14} className="mr-2" />Télécharger</DropdownMenuItem>
                       <DropdownMenuItem onClick={() => setEditDoc({ ...d, tagsStr: (d.tags || []).join(", "), folder_id: d.folder_id || "none" })}><Pencil size={14} className="mr-2" />Modifier</DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => openComments(d)} data-testid={`comments-${d.id}`}><MessageSquare size={14} className="mr-2" />Commentaires</DropdownMenuItem>
                       <DropdownMenuItem onClick={() => toggleArchive(d)}><Archive size={14} className="mr-2" />{d.is_archived ? "Désarchiver" : "Archiver"}</DropdownMenuItem>
                       {(user?.role === "admin" || d.uploaded_by === user?.id) && (
                         <>
@@ -369,6 +406,61 @@ export default function Documents({ archivedView = false }) {
             <Button variant="outline" onClick={() => setShareDoc(null)}>Annuler</Button>
             <Button onClick={saveShare} className="bg-[#0f4c3a] hover:bg-[#1a6b53] text-white">Enregistrer</Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Comments Dialog */}
+      <Dialog open={!!commentsDoc} onOpenChange={(o) => { if (!o) { setCommentsDoc(null); setComments([]); } }}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Discussion · {commentsDoc?.title}</DialogTitle>
+            <DialogDescription>
+              Échangez des notes avec les agents qui ont accès à ce document.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 max-h-[400px] overflow-y-auto py-2" data-testid="comments-list">
+            {comments.length === 0 && (
+              <div className="text-center text-sm text-gray-500 py-6">
+                <MessageSquare size={28} className="mx-auto text-gray-300 mb-2" />
+                Aucun commentaire pour l'instant.
+              </div>
+            )}
+            {comments.map((c) => {
+              const mine = c.user_id === user?.id;
+              const canDelete = mine || user?.role === "admin";
+              return (
+                <div key={c.id} className={`flex ${mine ? "justify-end" : "justify-start"}`} data-testid={`comment-${c.id}`}>
+                  <div className={`max-w-[80%] rounded-lg px-3 py-2 ${mine ? "bg-[#0f4c3a] text-white" : "bg-gray-100 text-gray-900"}`}>
+                    <div className={`text-xs font-semibold mb-0.5 ${mine ? "text-white/80" : "text-[#0f4c3a]"}`}>{c.user_name}</div>
+                    <div className="text-sm whitespace-pre-wrap">{c.content}</div>
+                    <div className={`text-[10px] mt-1 flex items-center justify-between gap-2 ${mine ? "text-white/60" : "text-gray-500"}`}>
+                      <span>{formatDate(c.created_at)}</span>
+                      {canDelete && (
+                        <button
+                          onClick={() => removeComment(c.id)}
+                          className={`hover:underline ${mine ? "text-white/80" : "text-red-600"}`}
+                          data-testid={`comment-delete-${c.id}`}
+                        >
+                          Supprimer
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <form onSubmit={sendComment} className="flex gap-2 pt-3 border-t border-gray-100">
+            <Input
+              value={commentDraft}
+              onChange={(e) => setCommentDraft(e.target.value)}
+              placeholder="Écrire un commentaire..."
+              data-testid="comment-input"
+            />
+            <Button type="submit" className="bg-[#0f4c3a] hover:bg-[#1a6b53] text-white" data-testid="comment-submit">
+              <Send size={14} />
+            </Button>
+          </form>
         </DialogContent>
       </Dialog>
     </div>

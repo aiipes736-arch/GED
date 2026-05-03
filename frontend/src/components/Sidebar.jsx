@@ -10,6 +10,9 @@ import {
   LogOut,
   Shield,
   FileBarChart,
+  MessageSquare,
+  Inbox,
+  Megaphone,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { LOGO_URL } from "../lib/api";
@@ -18,9 +21,12 @@ import { Avatar, AvatarFallback } from "./ui/avatar";
 
 const items = [
   { to: "/", label: "Tableau de bord", icon: LayoutDashboard, exact: true, testId: "nav-dashboard" },
+  { to: "/inbox", label: "Boîte de réception", icon: Inbox, testId: "nav-inbox" },
+  { to: "/messages", label: "Messagerie", icon: MessageSquare, testId: "nav-messages" },
   { to: "/documents", label: "Documents", icon: FileText, testId: "nav-documents" },
   { to: "/folders", label: "Dossiers", icon: FolderOpen, testId: "nav-folders" },
   { to: "/archive", label: "Archives", icon: Archive, testId: "nav-archives" },
+  { to: "/announcements", label: "Annonces", icon: Megaphone, testId: "nav-announcements" },
   { to: "/activity", label: "Journal d'activité", icon: History, testId: "nav-activity" },
   { to: "/reports", label: "Rapports", icon: FileBarChart, adminOnly: true, testId: "nav-reports" },
   { to: "/agents", label: "Agents", icon: Users, adminOnly: true, testId: "nav-agents" },

@@ -133,6 +133,22 @@ class PasswordResetIn(BaseModel):
     new_password: str
 
 
+class MessageCreate(BaseModel):
+    to_user_id: str
+    content: str
+    attachment_doc_id: Optional[str] = None
+
+
+class CommentCreate(BaseModel):
+    content: str
+
+
+class AnnouncementCreate(BaseModel):
+    title: str
+    content: str
+    expires_at: Optional[str] = None  # ISO date string
+
+
 # ===================== Helpers =====================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -761,6 +777,274 @@ async def report_monthly_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ===================== Messages =====================
+async def _user_lite(uid: str) -> dict:
+    try:
+        u = await db.users.find_one({"_id": ObjectId(uid)}, {"_id": 0, "name": 1, "email": 1, "role": 1})
+    except Exception:
+        u = None
+    return {
+        "id": uid,
+        "name": (u or {}).get("name", "Utilisateur"),
+        "email": (u or {}).get("email", ""),
+        "role": (u or {}).get("role", "agent"),
+    }
+
+
+@api.post("/messages")
+async def send_message(body: MessageCreate, user: dict = Depends(current_user_dep)):
+    if not body.content.strip() and not body.attachment_doc_id:
+        raise HTTPException(status_code=400, detail="Message vide")
+    try:
+        ObjectId(body.to_user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Destinataire invalide")
+    target = await db.users.find_one({"_id": ObjectId(body.to_user_id)})
+    if not target:
+        raise HTTPException(status_code=404, detail="Destinataire introuvable")
+    if body.to_user_id == user["id"]:
+        raise HTTPException(status_code=400, detail="Vous ne pouvez pas vous envoyer un message")
+
+    attachment = None
+    if body.attachment_doc_id:
+        d = await db.documents.find_one(
+            {"id": body.attachment_doc_id, "is_deleted": False},
+            {"_id": 0, "id": 1, "title": 1, "original_filename": 1},
+        )
+        if d:
+            attachment = d
+    msg = {
+        "id": str(uuid.uuid4()),
+        "from_user_id": user["id"],
+        "from_user_name": user.get("name", ""),
+        "to_user_id": body.to_user_id,
+        "to_user_name": target.get("name", ""),
+        "content": body.content,
+        "attachment": attachment,
+        "is_read": False,
+        "created_at": now_iso(),
+    }
+    await db.messages.insert_one(msg)
+    await create_notification(
+        user_id=body.to_user_id,
+        title="Nouveau message",
+        message=f"{user.get('name', 'Un agent')} vous a envoyé un message",
+        link="/messages",
+        actor_name=user.get("name", ""),
+    )
+    msg.pop("_id", None)
+    return msg
+
+
+@api.get("/messages/conversations")
+async def list_conversations(user: dict = Depends(current_user_dep)):
+    """Return list of conversations with last message + unread count for current user."""
+    pipeline = [
+        {"$match": {"$or": [{"from_user_id": user["id"]}, {"to_user_id": user["id"]}]}},
+        {"$sort": {"created_at": -1}},
+        {
+            "$group": {
+                "_id": {
+                    "$cond": [
+                        {"$eq": ["$from_user_id", user["id"]]},
+                        "$to_user_id",
+                        "$from_user_id",
+                    ]
+                },
+                "last_message": {"$first": "$$ROOT"},
+                "unread_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$and": [
+                                {"$eq": ["$to_user_id", user["id"]]},
+                                {"$eq": ["$is_read", False]},
+                            ]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {"$sort": {"last_message.created_at": -1}},
+    ]
+    raw = await db.messages.aggregate(pipeline).to_list(length=200)
+    out = []
+    for c in raw:
+        peer = await _user_lite(c["_id"])
+        last = c["last_message"]
+        last.pop("_id", None)
+        out.append({
+            "peer": peer,
+            "last_message": last,
+            "unread_count": c["unread_count"],
+        })
+    return out
+
+
+@api.get("/messages/conversation/{peer_id}")
+async def get_conversation(peer_id: str, user: dict = Depends(current_user_dep)):
+    cursor = db.messages.find({
+        "$or": [
+            {"from_user_id": user["id"], "to_user_id": peer_id},
+            {"from_user_id": peer_id, "to_user_id": user["id"]},
+        ]
+    }, {"_id": 0}).sort("created_at", 1)
+    msgs = await cursor.to_list(length=1000)
+    # Mark as read everything received
+    await db.messages.update_many(
+        {"to_user_id": user["id"], "from_user_id": peer_id, "is_read": False},
+        {"$set": {"is_read": True}},
+    )
+    peer = await _user_lite(peer_id)
+    return {"peer": peer, "messages": msgs}
+
+
+@api.get("/messages/unread-count")
+async def messages_unread_count(user: dict = Depends(current_user_dep)):
+    n = await db.messages.count_documents({"to_user_id": user["id"], "is_read": False})
+    return {"unread_count": n}
+
+
+# ===================== Document comments =====================
+@api.get("/documents/{doc_id}/comments")
+async def list_comments(doc_id: str, user: dict = Depends(current_user_dep)):
+    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
+    if not d:
+        raise HTTPException(status_code=404, detail="Document introuvable")
+    if not _has_access(d, user):
+        raise HTTPException(status_code=403, detail="Accès refusé")
+    cursor = db.comments.find({"doc_id": doc_id}, {"_id": 0}).sort("created_at", 1)
+    return await cursor.to_list(length=500)
+
+
+@api.post("/documents/{doc_id}/comments")
+async def add_comment(doc_id: str, body: CommentCreate, user: dict = Depends(current_user_dep)):
+    if not body.content.strip():
+        raise HTTPException(status_code=400, detail="Commentaire vide")
+    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
+    if not d:
+        raise HTTPException(status_code=404, detail="Document introuvable")
+    if not _has_access(d, user):
+        raise HTTPException(status_code=403, detail="Accès refusé")
+    c = {
+        "id": str(uuid.uuid4()),
+        "doc_id": doc_id,
+        "user_id": user["id"],
+        "user_name": user.get("name", ""),
+        "content": body.content,
+        "created_at": now_iso(),
+    }
+    await db.comments.insert_one(c)
+    # Notify the document owner if it's not the commenter
+    if d.get("uploaded_by") and d["uploaded_by"] != user["id"]:
+        await create_notification(
+            user_id=d["uploaded_by"],
+            title="Nouveau commentaire",
+            message=f"{user.get('name', 'Un agent')} a commenté « {d['title']} »",
+            link="/documents",
+            actor_name=user.get("name", ""),
+        )
+    c.pop("_id", None)
+    return c
+
+
+@api.delete("/comments/{comment_id}")
+async def delete_comment(comment_id: str, user: dict = Depends(current_user_dep)):
+    c = await db.comments.find_one({"id": comment_id})
+    if not c:
+        raise HTTPException(status_code=404, detail="Commentaire introuvable")
+    if user.get("role") != "admin" and c["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Accès refusé")
+    await db.comments.delete_one({"id": comment_id})
+    return {"message": "Commentaire supprimé"}
+
+
+# ===================== Inbox =====================
+@api.get("/inbox")
+async def list_inbox(user: dict = Depends(current_user_dep)):
+    """Documents shared WITH the current user (the inbox)."""
+    cursor = db.documents.find({
+        "is_deleted": False,
+        "shared_with": user["id"],
+    }).sort("created_at", -1)
+    out = []
+    reads = await db.inbox_reads.find({"user_id": user["id"]}, {"_id": 0, "doc_id": 1}).to_list(length=2000)
+    read_ids = {r["doc_id"] for r in reads}
+    async for d in cursor:
+        d = await _enrich_doc(d)
+        d["is_read"] = d["id"] in read_ids
+        out.append(d)
+    unread = sum(1 for x in out if not x["is_read"])
+    return {"items": out, "unread_count": unread}
+
+
+@api.post("/inbox/{doc_id}/read")
+async def mark_inbox_read(doc_id: str, user: dict = Depends(current_user_dep)):
+    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
+    if not d or user["id"] not in d.get("shared_with", []):
+        raise HTTPException(status_code=404, detail="Élément introuvable")
+    await db.inbox_reads.update_one(
+        {"user_id": user["id"], "doc_id": doc_id},
+        {"$set": {"user_id": user["id"], "doc_id": doc_id, "read_at": now_iso()}},
+        upsert=True,
+    )
+    return {"message": "ok"}
+
+
+# ===================== Announcements =====================
+@api.get("/announcements")
+async def list_announcements(user: dict = Depends(current_user_dep)):
+    now_str = now_iso()
+    cursor = db.announcements.find({
+        "$or": [{"expires_at": None}, {"expires_at": {"$gt": now_str}}]
+    }, {"_id": 0}).sort("created_at", -1)
+    return await cursor.to_list(length=100)
+
+
+@api.post("/announcements")
+async def create_announcement(body: AnnouncementCreate, user: dict = Depends(current_user_dep)):
+    require_admin(user)
+    if not body.title.strip() or not body.content.strip():
+        raise HTTPException(status_code=400, detail="Titre et contenu requis")
+    a = {
+        "id": str(uuid.uuid4()),
+        "title": body.title,
+        "content": body.content,
+        "expires_at": body.expires_at,
+        "author_id": user["id"],
+        "author_name": user.get("name", ""),
+        "created_at": now_iso(),
+    }
+    await db.announcements.insert_one(a)
+    # Notify all active users (except the author)
+    cursor = db.users.find({"is_active": True}, {"_id": 1, "name": 1})
+    async for u in cursor:
+        uid = str(u["_id"])
+        if uid == user["id"]:
+            continue
+        await create_notification(
+            user_id=uid,
+            title="📢 " + body.title,
+            message=body.content[:140] + ("…" if len(body.content) > 140 else ""),
+            link="/",
+            actor_name=user.get("name", ""),
+        )
+    await log_activity(user["id"], user.get("name", ""), "announcement_created", f"Annonce: {body.title}", "announcement", a["id"])
+    a.pop("_id", None)
+    return a
+
+
+@api.delete("/announcements/{ann_id}")
+async def delete_announcement(ann_id: str, user: dict = Depends(current_user_dep)):
+    require_admin(user)
+    a = await db.announcements.find_one({"id": ann_id})
+    if not a:
+        raise HTTPException(status_code=404, detail="Annonce introuvable")
+    await db.announcements.delete_one({"id": ann_id})
+    return {"message": "Annonce supprimée"}
 
 
 # ===================== Startup =====================

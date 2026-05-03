@@ -10,6 +10,9 @@ import Folders from "./pages/Folders";
 import Agents from "./pages/Agents";
 import Activity from "./pages/Activity";
 import Reports from "./pages/Reports";
+import Messages from "./pages/Messages";
+import Inbox from "./pages/Inbox";
+import Announcements from "./pages/Announcements";
 import Profile from "./pages/Profile";
 
 export default function App() {
@@ -26,6 +29,9 @@ export default function App() {
             <Route path="/agents" element={<Agents />} />
             <Route path="/activity" element={<Activity />} />
             <Route path="/reports" element={<Reports />} />
+            <Route path="/messages" element={<Messages />} />
+            <Route path="/inbox" element={<Inbox />} />
+            <Route path="/announcements" element={<Announcements />} />
             <Route path="/profile" element={<Profile />} />
           </Route>
         </Routes>
