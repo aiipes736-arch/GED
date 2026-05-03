@@ -1,0 +1,27 @@
+{
+  "summary": "Iteration 4 frontend-only retest of admin password reset flow on Agents page after fix in Agents.jsx (lines 194-196). All 6 retest scenarios PASS end-to-end via Playwright against the public preview URL. The kebab dropdown now exposes 'Réinitialiser le mot de passe' wired to setResetTarget(u) with data-testid='agent-reset-{id}'; the reset dialog opens with reset-password-input/reset-password-confirm/reset-password-submit; client-side validations fire correct French toasts ('Mot de passe trop court', 'Les deux mots de passe ne correspondent pas'); valid 8+ char matching password triggers success toast 'Mot de passe réinitialisé pour <name>' and closes the dialog. Notifications and Folders flows untouched per request.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/test_reports/iteration_4.json"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Agents.jsx submitReset uses minLength=6 on the inputs which triggers native HTML5 validation and would normally suppress the JS toast 'Mot de passe trop court (min 6 caractères)'. In the test the attribute had to be removed at runtime to actually exercise the JS branch. Consider lowering/removing minLength on the input (relying on the JS toast) or aligning the JS check to >0 so users get a single, consistent error UX. Currently both will fire, but native first.",
+    "Agents.jsx: the kebab MoreVertical trigger Button still has no data-testid - tests had to fall back to row.locator('button:has(svg)').last. Adding data-testid={`agent-menu-${u.id}`} would make tests more robust.",
+    "Agents.jsx: submitReset success path correctly closes the dialog and clears state; consider also calling load() to refresh last-activity timestamps if the API exposes them later.",
+    "server.py: deprecated @app.on_event startup/shutdown still flagged from iterations 1-3, untouched."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "not retested (was 28/28 green in iteration 2)", "frontend": "100% (6/6 reset scenarios pass)"},
+  "test_credentials": "admin@mhcged.cg / Admin@2026 (confirmed working)",
+  "seed_data_creation": "Created and then deleted a transient test agent uitest_<ts>@example.com / 'UITEST <ts>' during the run; no residual data.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Admin password reset flow on Agents page is fully green. If retesting, use a real-TLD email (uitest_<ts>@example.com) NOT .local. The reset-password-input has minLength=6 which will block native form submission for <6 char inputs - to exercise the 'Mot de passe trop court' JS toast, remove the minLength attribute at runtime via page.evaluate before submitting. Notifications and Folders flows still green from iteration 3, no need to retest.",
+  "rca_of_the_issue": "Iteration 3 RCA confirmed mitigated: Agents.jsx line 194 onClick now calls setResetTarget(u) (instead of the copy-pasted setEdit/setOpen pair) and the DropdownMenuItem carries data-testid={`agent-reset-${u.id}`}. End-to-end flow now functions as designed: dropdown -> reset dialog -> client validations -> POST /api/users/{id}/reset-password -> success toast + dialog close."
+}

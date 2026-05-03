@@ -191,8 +191,8 @@ export default function Agents() {
                       <DropdownMenuItem onClick={() => { setEdit(u); setForm({ email: u.email, password: "", name: u.name, role: u.role }); setOpen(true); }} data-testid={`agent-edit-${u.id}`}>
                         <Pencil size={14} className="mr-2" /> Modifier
                       </DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => { setEdit(u); setForm({ email: u.email, password: "", name: u.name, role: u.role }); setOpen(true); }}>
-                        <Key size={14} className="mr-2" /> Changer mot de passe
+                      <DropdownMenuItem onClick={() => setResetTarget(u)} data-testid={`agent-reset-${u.id}`}>
+                        <Key size={14} className="mr-2" /> Réinitialiser le mot de passe
                       </DropdownMenuItem>
                       {u.id !== user.id && (
                         <>
