@@ -36,8 +36,10 @@ Développer une Gestion Électronique des Documents (GED) professionnelle sécur
 - **In-app notifications**: bell icon in header (polling every 30s) with unread badge, dropdown listing notifs, mark-as-read individual + mark-all-read; auto-created on document share + admin password reset
 - **Hierarchical sub-folders**: parent_id support in Folders page (tree view with expand/collapse chevrons, "+" to add child folder, parent dropdown excludes descendants to prevent cycles)
 - **Admin password reset**: dedicated "Réinitialiser le mot de passe" action in Agents kebab menu, dialog with new password + confirmation, agent receives in-app notification automatically
-- New backend endpoints: `GET/POST /api/notifications`, `POST /api/notifications/{id}/read`, `POST /api/notifications/read-all`, `POST /api/users/{id}/reset-password`
-- All new feature tests passing: 28/28 backend + 100% frontend (notifications, folders hierarchy, password reset)
+- **Monthly PDF reports** (admin only): `/reports` page with month/year/agent selectors, live preview of Top 5 documents downloaded + Top active agents; one-click PDF download with institutional header (logo Congo armoiries + Ministère des Hydrocarbures), green/yellow/red color scheme, signature footer with admin name + date Brazzaville
+- New backend endpoints: `GET/POST /api/notifications`, `POST /api/notifications/{id}/read`, `POST /api/notifications/read-all`, `POST /api/users/{id}/reset-password`, `GET /api/reports/monthly`, `GET /api/reports/monthly/pdf`
+- All tests passing: 38/38 backend + 100% frontend (notifications, folders hierarchy, password reset, monthly reports)
+- New dependency: `reportlab==4.5.0` for PDF generation
 
 ## Backlog / Next Tasks
 - P1: Prévisualisation documents (PDF viewer inline)
