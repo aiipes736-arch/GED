@@ -32,6 +32,13 @@ Développer une Gestion Électronique des Documents (GED) professionnelle sécur
 - All backend tests passing (16/16)
 - data-testid attributes on interactive elements
 
+## What's Been Implemented (2026-05-03)
+- **In-app notifications**: bell icon in header (polling every 30s) with unread badge, dropdown listing notifs, mark-as-read individual + mark-all-read; auto-created on document share + admin password reset
+- **Hierarchical sub-folders**: parent_id support in Folders page (tree view with expand/collapse chevrons, "+" to add child folder, parent dropdown excludes descendants to prevent cycles)
+- **Admin password reset**: dedicated "Réinitialiser le mot de passe" action in Agents kebab menu, dialog with new password + confirmation, agent receives in-app notification automatically
+- New backend endpoints: `GET/POST /api/notifications`, `POST /api/notifications/{id}/read`, `POST /api/notifications/read-all`, `POST /api/users/{id}/reset-password`
+- All new feature tests passing: 28/28 backend + 100% frontend (notifications, folders hierarchy, password reset)
+
 ## Backlog / Next Tasks
 - P1: Prévisualisation documents (PDF viewer inline)
 - P1: Pagination côté backend (list_documents / list_folders / list_users / list_activity)
