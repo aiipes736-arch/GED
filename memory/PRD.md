@@ -41,6 +41,14 @@ Développer une Gestion Électronique des Documents (GED) professionnelle sécur
 - All tests passing: 38/38 backend + 100% frontend (notifications, folders hierarchy, password reset, monthly reports)
 - New dependency: `reportlab==4.5.0` for PDF generation
 
+## What's Been Implemented (2026-05-03 — communication suite)
+- **Private messaging** (`/messages`): conversation list, thread view, optional document attachment, unread badges, auto-notification on new message
+- **Document discussions**: "Commentaires" action in document kebab opens dialog with thread; commenter notifies the document owner
+- **Inbox** (`/inbox`): documents shared with the current user, "Nouveau" badge, mark-as-read + download, separate from main Documents list
+- **Broadcast announcements** (`/announcements`): admin-only create dialog with optional expiration; banner on Dashboard; broadcast notification to all active users
+- New backend endpoints: `/api/messages*`, `/api/documents/{id}/comments`, `/api/comments/{id}`, `/api/inbox*`, `/api/announcements*`
+- Tests: **64/64 backend** (auth + CRUD + folders + notifications + reports + communication) + 100% frontend
+
 ## Backlog / Next Tasks
 - P1: Prévisualisation documents (PDF viewer inline)
 - P1: Pagination côté backend (list_documents / list_folders / list_users / list_activity)
