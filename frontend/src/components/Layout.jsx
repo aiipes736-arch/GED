@@ -1,6 +1,7 @@
 import React from "react";
 import { Outlet, Navigate } from "react-router-dom";
 import Sidebar from "./Sidebar";
+import Header from "./Header";
 import { useAuth } from "../contexts/AuthContext";
 import { Toaster } from "./ui/sonner";
 
@@ -17,7 +18,10 @@ export default function Layout() {
     <div className="flex min-h-screen bg-[#f7f8f5]">
       <Sidebar />
       <main className="flex-1 min-w-0">
-        <div className="px-6 sm:px-8 py-6 sm:py-8 max-w-[1400px] mx-auto">
+        <div className="px-6 sm:px-8 py-4 max-w-[1400px] mx-auto">
+          <Header />
+        </div>
+        <div className="px-6 sm:px-8 pb-8 max-w-[1400px] mx-auto">
           <Outlet />
         </div>
       </main>

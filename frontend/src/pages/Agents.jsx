@@ -26,6 +26,9 @@ export default function Agents() {
   const [open, setOpen] = useState(false);
   const [edit, setEdit] = useState(null);
   const [form, setForm] = useState({ email: "", password: "", name: "", role: "agent" });
+  const [resetTarget, setResetTarget] = useState(null);
+  const [resetPwd, setResetPwd] = useState("");
+  const [resetPwd2, setResetPwd2] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -79,6 +82,27 @@ export default function Agents() {
       load();
     } catch (e) {
       toast.error(formatApiError(e.response?.data?.detail));
+    }
+  };
+
+  const submitReset = async (e) => {
+    e?.preventDefault?.();
+    if (resetPwd.length < 6) {
+      toast.error("Mot de passe trop court (min 6 caractères)");
+      return;
+    }
+    if (resetPwd !== resetPwd2) {
+      toast.error("Les deux mots de passe ne correspondent pas");
+      return;
+    }
+    try {
+      await api.post(`/users/${resetTarget.id}/reset-password`, { new_password: resetPwd });
+      toast.success(`Mot de passe réinitialisé pour ${resetTarget.name}`);
+      setResetTarget(null);
+      setResetPwd("");
+      setResetPwd2("");
+    } catch (err) {
+      toast.error(formatApiError(err.response?.data?.detail));
     }
   };
 
@@ -186,6 +210,52 @@ export default function Agents() {
           </TableBody>
         </Table>
       </div>
+
+      {/* Reset password dialog */}
+      <Dialog open={!!resetTarget} onOpenChange={(o) => { if (!o) { setResetTarget(null); setResetPwd(""); setResetPwd2(""); } }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Réinitialiser le mot de passe</DialogTitle>
+            <DialogDescription>
+              Vous êtes sur le point de définir un nouveau mot de passe pour <span className="font-semibold text-gray-900">{resetTarget?.name}</span> ({resetTarget?.email}). L'agent sera notifié dans son espace.
+            </DialogDescription>
+          </DialogHeader>
+          <form onSubmit={submitReset} className="space-y-3" data-testid="reset-password-form">
+            <div>
+              <Label>Nouveau mot de passe *</Label>
+              <Input
+                type="password"
+                value={resetPwd}
+                onChange={(e) => setResetPwd(e.target.value)}
+                required
+                minLength={6}
+                data-testid="reset-password-input"
+              />
+            </div>
+            <div>
+              <Label>Confirmation *</Label>
+              <Input
+                type="password"
+                value={resetPwd2}
+                onChange={(e) => setResetPwd2(e.target.value)}
+                required
+                minLength={6}
+                data-testid="reset-password-confirm"
+              />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setResetTarget(null)}>Annuler</Button>
+              <Button
+                type="submit"
+                className="bg-[#0f4c3a] hover:bg-[#1a6b53] text-white"
+                data-testid="reset-password-submit"
+              >
+                Réinitialiser
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

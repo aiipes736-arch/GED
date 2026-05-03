@@ -1,0 +1,56 @@
+{
+  "summary": "Iteration 2 testing of the 3 new feature sets (notifications, folder hierarchy, admin password reset). Backend: 12/12 new-feature pytest tests PASS (all notification endpoints, admin password reset with all error paths, folder parent_id hierarchy, and share->notification flow including 'new users only' semantics). Frontend: BLOCKED by a webpack/Babel compile error in /app/frontend/src/pages/Folders.jsx (RangeError: Maximum call stack size exceeded during Babel traversal), which prevents the entire React bundle from compiling. No UI route (including /login, /dashboard, /folders, /agents) renders - user sees the dev-server error overlay instead of the app.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "Folders.jsx",
+        "issue": "Webpack/Babel compilation error: 'RangeError: /app/frontend/src/pages/Folders.jsx: Maximum call stack size exceeded' during @babel/traverse. The whole app fails to build; users see the red 'Compiled with problems' overlay on every route. Likely triggered by the self-recursive <FolderRow/> component rendering itself inside a JSX fragment (<>...</>) combined with the current @babel-loader plugin pipeline.",
+        "selector": "/app/frontend/src/pages/Folders.jsx (FolderRow component, lines 27-101)",
+        "priority": "CRITICAL"
+      }
+    ],
+    "integration_issues": [
+      {
+        "flow": "All UI flows (login, notifications bell, folders tree, agents reset-password dialog)",
+        "issue": "Could not be tested end-to-end because the frontend bundle does not compile. Once Folders.jsx is fixed, re-run the Playwright checks for: notif-bell / notif-dropdown / notif-mark-all, folder-add-child-{id} / folder-parent dropdown, and agent-reset-{id} -> reset-password-input/confirm/submit.",
+        "affected_selectors": ["notif-bell", "notif-dropdown", "notif-mark-all", "folder-parent", "folder-add-child-{id}", "agent-reset-{id}", "reset-password-input", "reset-password-confirm", "reset-password-submit"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/test_reports/pytest/pytest_new_features.xml",
+    "/app/backend/tests/test_backend.py"
+  ],
+  "action_items": [
+    "CRITICAL: Fix Folders.jsx Babel compile error. Suggested fixes (try in order): (1) Move the recursive <FolderRow/> render out of the inline fragment - e.g., return an array [rowElement, ...node.children.map(...)] or wrap in a <div> instead of <>...</>; (2) Extract the recursive children rendering into a separate memoised component that takes the tree and flattens it before render; (3) As a last resort, replace the self-referencing JSX tag with React.createElement(FolderRow, ...) to avoid the Babel traversal loop. Verify by running 'yarn start' and confirming no compile error in /var/log/supervisor/frontend.*.log.",
+    "After Folders.jsx compiles, re-run Playwright UI tests for the 3 new feature sets. Backend is fully verified and needs no further changes."
+  ],
+  "critical_code_review_comments": [
+    "Folders.jsx: FolderRow is a self-recursive component returning a fragment containing recursive siblings. Besides triggering the current Babel bug, deep hierarchies will also cause React key-warning noise and re-render the whole tree on any expand/collapse. Consider flattening the tree into an array (with depth) via useMemo and rendering a flat list of rows.",
+    "Folders.jsx remove(): detaches children with sequential api.put then api.delete - if any child update fails the parent still gets deleted. Wrap in try/await-all and abort on error, or perform the re-parenting server-side in a single endpoint.",
+    "server.py admin_reset_password: validates length AFTER hashing lookup; length check should come before any DB work. Also password policy only enforces length - add complexity rules consistent with the rest of the app.",
+    "server.py create_folder: no check that parent_id is not the same as (future) id and no depth limit / cycle prevention server-side. The 'circular prevention is UI-only' contract is brittle - a direct API call can still set parent_id to a descendant and create a cycle that will break list_folders/tree building forever. Add server-side ancestor check in create_folder and update_folder.",
+    "server.py list_notifications: no pagination cursor beyond the 'limit' query param and no filter for unread-only. Will grow unbounded per user.",
+    "server.py share_document: notifications are only created for newly added users (correct per spec), but removed users are not notified of revocation - intentional? Document or add a symmetric notification.",
+    "server.py still uses deprecated @app.on_event('startup'/'shutdown') (flagged in iteration 1, not fixed)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py (new)"
+  ],
+  "success_rate": {
+    "backend": "100% (12/12 new + 16/16 existing)",
+    "frontend": "0% (build fails - no route renders)"
+  },
+  "test_credentials": "admin@mhcged.cg / Admin@2026 (confirmed working via API)",
+  "seed_data_creation": "Tests create TEST_ and UITEST_ prefixed users, folders, and documents and clean them up in fixtures / at end of each test. No residual data expected.",
+  "retest_needed": true,
+  "main_agent_can_self_test": false,
+  "context_for_next_testing_agent": "Backend new-feature surface is fully green (see /app/backend/tests/test_new_features.py). The ONLY blocker is the Babel compile error in Folders.jsx. After the main agent fixes that file, re-run Playwright flows for: (a) header bell: notif-bell visible after login, notif-badge appears when unread>0, notif-dropdown lists items, clicking notif-item-{id} marks read, notif-mark-all clears the badge; (b) Folders page: new-folder-btn opens dialog with folder-parent dropdown, folder-submit creates a root folder, hover on row reveals folder-add-child-{id}, creating a child produces a chevron on parent; (c) Agents page: click row actions menu, agent-reset-{id} opens dialog with reset-password-input/confirm/submit and a short password shows an inline error (should also surface backend's 400 if sent). The backend test file already covers the server-side guarantees for all three.",
+  "rca_of_the_issue": "Folders.jsx defines FolderRow as a named function component that renders itself via <FolderRow .../> inside a JSX fragment. Under the current react-scripts/@babel-loader configuration, the traversal of this recursive JSX enters an unbounded recursion in @babel/traverse (visitMultiple -> visit -> traverseNode loop visible in stack). Reproduction: touch any file, observe /var/log/supervisor/frontend.*.log - compilation fails with 'RangeError: Maximum call stack size exceeded' in Folders.jsx. Mitigation: break the recursive self-reference by either rendering a flat list (buildTree + flatten with depth in useMemo) or by wrapping the recursive sibling render in React.createElement(FolderRow, ...) / a separate component, or simply replacing the top-level <>...</> fragment with a <div> or React.Fragment import. All three alternatives are known to defuse this specific Babel traversal bug."
+}

@@ -128,6 +128,10 @@ class ShareIn(BaseModel):
     user_ids: List[str]
 
 
+class PasswordResetIn(BaseModel):
+    new_password: str
+
+
 # ===================== Helpers =====================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -154,6 +158,22 @@ async def log_activity(user_id: str, user_name: str, action: str, details: str =
         "target_type": target_type,
         "target_id": target_id,
         "timestamp": now_iso(),
+    })
+
+
+async def create_notification(user_id: str, title: str, message: str, link: str = "", actor_name: str = ""):
+    """Create an in-app notification for a user."""
+    if not user_id:
+        return
+    await db.notifications.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "title": title,
+        "message": message,
+        "link": link,
+        "actor_name": actor_name,
+        "is_read": False,
+        "created_at": now_iso(),
     })
 
 
@@ -513,7 +533,19 @@ async def share_document(doc_id: str, body: ShareIn, user: dict = Depends(curren
         raise HTTPException(status_code=404, detail="Document introuvable")
     if user.get("role") != "admin" and d.get("uploaded_by") != user["id"]:
         raise HTTPException(status_code=403, detail="Seul l'auteur ou l'admin peut partager")
-    await db.documents.update_one({"id": doc_id}, {"$set": {"shared_with": body.user_ids}})
+    prev = set(d.get("shared_with", []))
+    new_ids = set(body.user_ids)
+    added = new_ids - prev
+    await db.documents.update_many({"id": doc_id}, {"$set": {"shared_with": body.user_ids}})
+    # Notify newly added users
+    for uid in added:
+        await create_notification(
+            user_id=uid,
+            title="Document partagé avec vous",
+            message=f"{user.get('name', 'Un agent')} vous a partagé « {d['title']} »",
+            link=f"/documents",
+            actor_name=user.get("name", ""),
+        )
     await log_activity(user["id"], user["name"], "document_shared", f"Document partagé: {d['title']}", "document", doc_id)
     return {"message": "Document partagé", "shared_with": body.user_ids}
 
@@ -566,6 +598,58 @@ async def list_activity(limit: int = 100, user: dict = Depends(current_user_dep)
     q = {} if user.get("role") == "admin" else {"user_id": user["id"]}
     cursor = db.activity_logs.find(q, {"_id": 0}).sort("timestamp", -1).limit(limit)
     return await cursor.to_list(length=limit)
+
+
+# ===================== Notifications =====================
+@api.get("/notifications")
+async def list_notifications(limit: int = 30, user: dict = Depends(current_user_dep)):
+    cursor = db.notifications.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).limit(limit)
+    items = await cursor.to_list(length=limit)
+    unread = await db.notifications.count_documents({"user_id": user["id"], "is_read": False})
+    return {"items": items, "unread_count": unread}
+
+
+@api.post("/notifications/{notif_id}/read")
+async def mark_notification_read(notif_id: str, user: dict = Depends(current_user_dep)):
+    await db.notifications.update_one(
+        {"id": notif_id, "user_id": user["id"]},
+        {"$set": {"is_read": True}},
+    )
+    return {"message": "ok"}
+
+
+@api.post("/notifications/read-all")
+async def mark_all_notifications_read(user: dict = Depends(current_user_dep)):
+    await db.notifications.update_many(
+        {"user_id": user["id"], "is_read": False},
+        {"$set": {"is_read": True}},
+    )
+    return {"message": "ok"}
+
+
+# ===================== Admin password reset =====================
+@api.post("/users/{user_id}/reset-password")
+async def admin_reset_password(user_id: str, body: PasswordResetIn, user: dict = Depends(current_user_dep)):
+    require_admin(user)
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID invalide")
+    target = await db.users.find_one({"_id": oid})
+    if not target:
+        raise HTTPException(status_code=404, detail="Agent introuvable")
+    if len(body.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Mot de passe trop court (min 6 caractères)")
+    await db.users.update_one({"_id": oid}, {"$set": {"password_hash": hash_password(body.new_password)}})
+    await log_activity(user["id"], user["name"], "password_reset", f"Mot de passe réinitialisé pour: {target['email']}", "user", user_id)
+    await create_notification(
+        user_id=str(oid),
+        title="Mot de passe réinitialisé",
+        message=f"Votre mot de passe a été réinitialisé par {user.get('name', 'un administrateur')}.",
+        link="/profile",
+        actor_name=user.get("name", ""),
+    )
+    return {"message": "Mot de passe réinitialisé"}
 
 
 # ===================== Startup =====================
