@@ -9,6 +9,7 @@ import {
   History,
   LogOut,
   Shield,
+  FileBarChart,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { LOGO_URL } from "../lib/api";
@@ -21,6 +22,7 @@ const items = [
   { to: "/folders", label: "Dossiers", icon: FolderOpen, testId: "nav-folders" },
   { to: "/archive", label: "Archives", icon: Archive, testId: "nav-archives" },
   { to: "/activity", label: "Journal d'activité", icon: History, testId: "nav-activity" },
+  { to: "/reports", label: "Rapports", icon: FileBarChart, adminOnly: true, testId: "nav-reports" },
   { to: "/agents", label: "Agents", icon: Users, adminOnly: true, testId: "nav-agents" },
 ];
 

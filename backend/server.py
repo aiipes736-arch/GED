@@ -33,6 +33,7 @@ from auth import (
     require_admin,
 )
 import storage
+import reports as reports_mod
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -543,7 +544,7 @@ async def share_document(doc_id: str, body: ShareIn, user: dict = Depends(curren
             user_id=uid,
             title="Document partagé avec vous",
             message=f"{user.get('name', 'Un agent')} vous a partagé « {d['title']} »",
-            link=f"/documents",
+            link="/documents",
             actor_name=user.get("name", ""),
         )
     await log_activity(user["id"], user["name"], "document_shared", f"Document partagé: {d['title']}", "document", doc_id)
@@ -650,6 +651,116 @@ async def admin_reset_password(user_id: str, body: PasswordResetIn, user: dict =
         actor_name=user.get("name", ""),
     )
     return {"message": "Mot de passe réinitialisé"}
+
+
+# ===================== Reports =====================
+async def _build_report_data(year: int, month: int, agent_id: Optional[str]):
+    """Compute top documents and top agents for the given month + optional agent filter."""
+    if month < 1 or month > 12:
+        raise HTTPException(status_code=400, detail="Mois invalide")
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    if month == 12:
+        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+    start_iso = start.isoformat()
+    end_iso = end.isoformat()
+
+    # Activity logs filter for the month
+    activity_match = {"timestamp": {"$gte": start_iso, "$lt": end_iso}}
+    if agent_id:
+        activity_match["user_id"] = agent_id
+
+    # Top documents (most downloaded)
+    download_match = {**activity_match, "action": "document_downloaded", "target_id": {"$ne": ""}}
+    top_docs_raw = await db.activity_logs.aggregate([
+        {"$match": download_match},
+        {"$group": {"_id": "$target_id", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 5},
+    ]).to_list(length=5)
+
+    top_docs = []
+    for entry in top_docs_raw:
+        d = await db.documents.find_one({"id": entry["_id"]}, {"_id": 0, "title": 1})
+        title = d["title"] if d else f"Document {entry['_id'][:8]}"
+        top_docs.append({"id": entry["_id"], "title": title, "count": entry["count"]})
+
+    # Top agents (most actions) - only meaningful when looking at all agents
+    top_agents_raw = await db.activity_logs.aggregate([
+        {"$match": activity_match},
+        {"$group": {"_id": "$user_id", "name": {"$first": "$user_name"}, "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 5},
+    ]).to_list(length=5)
+    top_agents = [
+        {"id": a["_id"], "name": a.get("name") or "—", "count": a["count"]}
+        for a in top_agents_raw
+    ]
+
+    # Scope label for header
+    if agent_id:
+        agent_doc = None
+        try:
+            agent_doc = await db.users.find_one({"_id": ObjectId(agent_id)}, {"_id": 0, "name": 1, "email": 1})
+        except Exception:
+            agent_doc = None
+        scope_label = f"Agent : {agent_doc['name'] if agent_doc else agent_id}"
+    else:
+        scope_label = "Tous les agents"
+
+    return {
+        "top_docs": top_docs,
+        "top_agents": top_agents,
+        "scope_label": scope_label,
+    }
+
+
+@api.get("/reports/monthly")
+async def report_monthly_preview(
+    year: int = Query(..., ge=2000, le=3000),
+    month: int = Query(..., ge=1, le=12),
+    agent_id: Optional[str] = Query(None),
+    user: dict = Depends(current_user_dep),
+):
+    """Return the report data as JSON (preview before PDF download)."""
+    require_admin(user)
+    data = await _build_report_data(year, month, agent_id)
+    return data
+
+
+@api.get("/reports/monthly/pdf")
+async def report_monthly_pdf(
+    year: int = Query(..., ge=2000, le=3000),
+    month: int = Query(..., ge=1, le=12),
+    agent_id: Optional[str] = Query(None),
+    user: dict = Depends(current_user_dep),
+):
+    """Generate and stream the monthly PDF report."""
+    require_admin(user)
+    data = await _build_report_data(year, month, agent_id)
+    pdf_bytes = reports_mod.build_monthly_report_pdf(
+        year=year,
+        month=month,
+        scope_label=data["scope_label"],
+        top_docs=data["top_docs"],
+        top_agents=data["top_agents"],
+        signed_by_name=user.get("name") or "Administrateur",
+        signed_by_role="Administrateur · MHCGED",
+    )
+    await log_activity(
+        user["id"], user.get("name", ""),
+        "report_generated",
+        f"Rapport mensuel généré: {month:02d}/{year}" + (f" (agent {agent_id})" if agent_id else ""),
+        "report",
+        f"{year}-{month:02d}",
+    )
+    filename = f"rapport-mhcged-{year}-{month:02d}.pdf"
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ===================== Startup =====================

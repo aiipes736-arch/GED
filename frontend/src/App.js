@@ -9,6 +9,7 @@ import Documents from "./pages/Documents";
 import Folders from "./pages/Folders";
 import Agents from "./pages/Agents";
 import Activity from "./pages/Activity";
+import Reports from "./pages/Reports";
 import Profile from "./pages/Profile";
 
 export default function App() {
@@ -24,6 +25,7 @@ export default function App() {
             <Route path="/archive" element={<Documents archivedView={true} />} />
             <Route path="/agents" element={<Agents />} />
             <Route path="/activity" element={<Activity />} />
+            <Route path="/reports" element={<Reports />} />
             <Route path="/profile" element={<Profile />} />
           </Route>
         </Routes>
