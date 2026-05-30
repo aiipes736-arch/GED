@@ -13,9 +13,10 @@ import {
   MessageSquare,
   Inbox,
   Megaphone,
+  Settings,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
-import { LOGO_URL } from "../lib/api";
+import { useSettings } from "../contexts/SettingsContext";
 import { Button } from "./ui/button";
 import { Avatar, AvatarFallback } from "./ui/avatar";
 
@@ -30,10 +31,12 @@ const items = [
   { to: "/activity", label: "Journal d'activité", icon: History, testId: "nav-activity" },
   { to: "/reports", label: "Rapports", icon: FileBarChart, adminOnly: true, testId: "nav-reports" },
   { to: "/agents", label: "Agents", icon: Users, adminOnly: true, testId: "nav-agents" },
+  { to: "/settings", label: "Paramètres", icon: Settings, adminOnly: true, testId: "nav-settings" },
 ];
 
 export default function Sidebar() {
   const { user, logout } = useAuth();
+  const { logo_url } = useSettings();
   const navigate = useNavigate();
   const isAdmin = user?.role === "admin";
 
@@ -52,7 +55,7 @@ export default function Sidebar() {
   return (
     <aside className="hidden lg:flex w-64 flex-col bg-white border-r border-gray-200 min-h-screen" data-testid="sidebar">
       <div className="flex items-center gap-3 px-5 py-5 border-b border-gray-200">
-        <img src={LOGO_URL} alt="MHCGED" className="w-11 h-11 rounded-md object-cover" data-testid="sidebar-logo" />
+        <img src={logo_url} alt="MHCGED" className="w-11 h-11 rounded-md object-cover" data-testid="sidebar-logo" />
         <div>
           <div className="font-bold text-gray-900 leading-none tracking-tight" style={{ fontFamily: "Work Sans" }}>MHCGED</div>
           <div className="text-[11px] uppercase tracking-[0.18em] text-gray-500 mt-1">Ministère des Hydrocarbures</div>

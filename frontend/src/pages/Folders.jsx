@@ -10,6 +10,7 @@ import {
 } from "../components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { FolderOpen, Plus, Pencil, Trash2, ChevronRight, ChevronDown, Folder } from "lucide-react";
+import { useAuth } from "../contexts/AuthContext";
 
 // Flatten folders into a list of {folder, depth, hasChildren} respecting expand state
 function flattenTree(folders, expanded) {
@@ -35,6 +36,8 @@ function flattenTree(folders, expanded) {
 }
 
 export default function Folders() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
   const [folders, setFolders] = useState([]);
   const [open, setOpen] = useState(false);
   const [edit, setEdit] = useState(null);

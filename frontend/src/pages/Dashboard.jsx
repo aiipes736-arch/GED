@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import api, { formatBytes, formatDate } from "../lib/api";
-import { FileText, FolderOpen, Users, Archive, HardDrive, TrendingUp, Megaphone } from "lucide-react";
+import { FileText, FolderOpen, Users, Archive, HardDrive, TrendingUp, Megaphone, Inbox, MessageSquare, Settings, LogOut, FileBarChart } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 
 function StatCard({ icon: Icon, label, value, accent, testId }) {
@@ -20,7 +21,8 @@ function StatCard({ icon: Icon, label, value, accent, testId }) {
 }
 
 export default function Dashboard() {
-  const { user } = useAuth();
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
   const [stats, setStats] = useState(null);
   const [announcements, setAnnouncements] = useState([]);
 
@@ -29,16 +31,40 @@ export default function Dashboard() {
     api.get("/announcements").then((r) => setAnnouncements(r.data.slice(0, 3))).catch(() => {});
   }, []);
 
+  const isAdmin = user?.role === "admin";
+
+  const tiles = [
+    { to: "/documents", label: "Documents", icon: FileText, color: "bg-[#e8f3ed] text-[#0f4c3a]", testId: "tile-documents" },
+    { to: "/folders", label: "Dossiers", icon: FolderOpen, color: "bg-amber-50 text-amber-700", testId: "tile-folders" },
+    { to: "/inbox", label: "Boîte réception", icon: Inbox, color: "bg-blue-50 text-blue-700", testId: "tile-inbox" },
+    { to: "/messages", label: "Messagerie", icon: MessageSquare, color: "bg-purple-50 text-purple-700", testId: "tile-messages" },
+    { to: "/announcements", label: "Annonces", icon: Megaphone, color: "bg-yellow-50 text-yellow-700", testId: "tile-announcements" },
+    ...(isAdmin ? [
+      { to: "/agents", label: "Agents", icon: Users, color: "bg-cyan-50 text-cyan-700", testId: "tile-agents" },
+      { to: "/reports", label: "Rapports", icon: FileBarChart, color: "bg-indigo-50 text-indigo-700", testId: "tile-reports" },
+      { to: "/settings", label: "Paramètres", icon: Settings, color: "bg-gray-100 text-gray-700", testId: "tile-settings" },
+    ] : []),
+  ];
+
   return (
     <div className="space-y-8" data-testid="dashboard-page">
-      <div>
-        <div className="text-[11px] uppercase tracking-[0.25em] text-[#0f4c3a] font-semibold">Vue d'ensemble</div>
-        <h1 className="text-3xl sm:text-4xl font-bold mt-1 text-gray-900" style={{ fontFamily: "Work Sans" }}>
-          Bonjour, {user?.name?.split(" ")[0] || "Agent"}
-        </h1>
-        <p className="text-sm text-gray-500 mt-1">
-          Aperçu de votre plateforme MHCGED — {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
-        </p>
+      <div className="flex items-end justify-between flex-wrap gap-3">
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.25em] text-[#0f4c3a] font-semibold">Vue d'ensemble</div>
+          <h1 className="text-3xl sm:text-4xl font-bold mt-1 text-gray-900" style={{ fontFamily: "Work Sans" }}>
+            Bonjour, {user?.name?.split(" ")[0] || "Agent"}
+          </h1>
+          <p className="text-sm text-gray-500 mt-1">
+            Aperçu de votre plateforme MHCGED — {new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}
+          </p>
+        </div>
+        <button
+          onClick={async () => { await logout(); navigate("/login"); }}
+          className="inline-flex items-center gap-2 text-sm text-gray-600 hover:text-red-600 px-3 py-2 rounded-md hover:bg-red-50 transition-colors"
+          data-testid="dashboard-logout"
+        >
+          <LogOut size={14} /> Se déconnecter
+        </button>
       </div>
 
       {announcements.length > 0 && (
@@ -62,6 +88,28 @@ export default function Dashboard() {
           ))}
         </div>
       )}
+
+      <div>
+        <div className="text-[11px] uppercase tracking-[0.2em] text-gray-500 font-semibold mb-3">Accès rapides</div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3" data-testid="quick-tiles">
+          {tiles.map((t) => {
+            const Icon = t.icon;
+            return (
+              <button
+                key={t.to}
+                onClick={() => navigate(t.to)}
+                className="inst-card p-4 hover:shadow-md transition-shadow text-left group"
+                data-testid={t.testId}
+              >
+                <div className={`w-10 h-10 rounded-md flex items-center justify-center mb-3 ${t.color} group-hover:scale-105 transition-transform`}>
+                  <Icon size={18} />
+                </div>
+                <div className="text-sm font-medium text-gray-900">{t.label}</div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
         <StatCard

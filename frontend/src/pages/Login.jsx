@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useAuth } from "../contexts/AuthContext";
-import { LOGO_URL, HERO_URL } from "../lib/api";
+import { useSettings } from "../contexts/SettingsContext";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { Button } from "../components/ui/button";
@@ -10,6 +10,7 @@ import { Lock, Mail, Eye, EyeOff, ShieldCheck } from "lucide-react";
 
 export default function Login() {
   const { login, user } = useAuth();
+  const { logo_url, hero_url } = useSettings();
   const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -38,12 +39,12 @@ export default function Login() {
       {/* Left - institutional hero */}
       <div
         className="hidden lg:flex relative w-1/2 bg-cover bg-center"
-        style={{ backgroundImage: `url(${HERO_URL})` }}
+        style={{ backgroundImage: `url(${hero_url})` }}
       >
         <div className="absolute inset-0 hero-overlay" />
         <div className="relative z-10 flex flex-col justify-between w-full p-12 text-white">
           <div className="flex items-center gap-3">
-            <img src={LOGO_URL} alt="MHCGED" className="w-14 h-14 rounded-md border-2 border-white/40" />
+            <img src={logo_url} alt="MHCGED" className="w-14 h-14 rounded-md border-2 border-white/40" />
             <div>
               <div className="text-xl font-bold tracking-tight" style={{ fontFamily: "Work Sans" }}>
                 MHCGED
@@ -85,7 +86,7 @@ export default function Login() {
       <div className="w-full lg:w-1/2 flex items-center justify-center bg-white p-6 sm:p-10">
         <div className="w-full max-w-md">
           <div className="lg:hidden flex items-center gap-3 mb-8">
-            <img src={LOGO_URL} alt="MHCGED" className="w-12 h-12 rounded-md" />
+            <img src={logo_url} alt="MHCGED" className="w-12 h-12 rounded-md" />
             <div>
               <div className="font-bold text-lg" style={{ fontFamily: "Work Sans" }}>MHCGED</div>
               <div className="text-[10px] uppercase tracking-[0.2em] text-gray-500">Ministère des Hydrocarbures</div>

@@ -17,7 +17,7 @@ import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator,
 } from "../components/ui/dropdown-menu";
 import {
-  Upload, Search, FileText, MoreVertical, Download, Trash2, Archive, Pencil, Share2, MessageSquare, Send,
+  Upload, Search, FileText, MoreVertical, Download, Trash2, Archive, Pencil, Share2, MessageSquare, Send, Eye, Printer, X,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 
@@ -43,6 +43,8 @@ export default function Documents({ archivedView = false }) {
   const [commentsDoc, setCommentsDoc] = useState(null);
   const [comments, setComments] = useState([]);
   const [commentDraft, setCommentDraft] = useState("");
+  const [previewDoc, setPreviewDoc] = useState(null);
+  const [previewUrl, setPreviewUrl] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -193,6 +195,33 @@ export default function Documents({ archivedView = false }) {
     }
   };
 
+  const openPreview = async (d) => {
+    try {
+      const res = await api.get(`/documents/${d.id}/download`, { responseType: "blob" });
+      const url = URL.createObjectURL(res.data);
+      setPreviewDoc(d);
+      setPreviewUrl(url);
+    } catch (e) {
+      toast.error(formatApiError(e.response?.data?.detail));
+    }
+  };
+
+  const closePreview = () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    setPreviewUrl(null);
+    setPreviewDoc(null);
+  };
+
+  const printPreview = () => {
+    const iframe = document.getElementById("pdf-preview-frame");
+    if (iframe?.contentWindow) {
+      iframe.contentWindow.focus();
+      iframe.contentWindow.print();
+    }
+  };
+
+  const isAdmin = user?.role === "admin";
+
   return (
     <div className="space-y-6" data-testid="documents-page">
       <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
@@ -326,14 +355,27 @@ export default function Documents({ archivedView = false }) {
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
                       <DropdownMenuItem onClick={() => downloadDoc(d)} data-testid={`download-${d.id}`}><Download size={14} className="mr-2" />Télécharger</DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => setEditDoc({ ...d, tagsStr: (d.tags || []).join(", "), folder_id: d.folder_id || "none" })}><Pencil size={14} className="mr-2" />Modifier</DropdownMenuItem>
+                      {d.content_type === "application/pdf" && (
+                        <DropdownMenuItem onClick={() => openPreview(d)} data-testid={`preview-${d.id}`}>
+                          <Eye size={14} className="mr-2" />Aperçu / Impression
+                        </DropdownMenuItem>
+                      )}
                       <DropdownMenuItem onClick={() => openComments(d)} data-testid={`comments-${d.id}`}><MessageSquare size={14} className="mr-2" />Commentaires</DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => toggleArchive(d)}><Archive size={14} className="mr-2" />{d.is_archived ? "Désarchiver" : "Archiver"}</DropdownMenuItem>
-                      {(user?.role === "admin" || d.uploaded_by === user?.id) && (
+                      {isAdmin && (
                         <>
-                          <DropdownMenuItem onClick={() => { setShareDoc(d); setShareSelected(d.shared_with || []); }}><Share2 size={14} className="mr-2" />Partager</DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => setEditDoc({ ...d, tagsStr: (d.tags || []).join(", "), folder_id: d.folder_id || "none" })} data-testid={`edit-${d.id}`}>
+                            <Pencil size={14} className="mr-2" />Modifier
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => toggleArchive(d)}>
+                            <Archive size={14} className="mr-2" />{d.is_archived ? "Désarchiver" : "Archiver"}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => { setShareDoc(d); setShareSelected(d.shared_with || []); }}>
+                            <Share2 size={14} className="mr-2" />Partager
+                          </DropdownMenuItem>
                           <DropdownMenuSeparator />
-                          <DropdownMenuItem onClick={() => deleteDoc(d)} className="text-red-600"><Trash2 size={14} className="mr-2" />Supprimer</DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => deleteDoc(d)} className="text-red-600" data-testid={`delete-${d.id}`}>
+                            <Trash2 size={14} className="mr-2" />Supprimer
+                          </DropdownMenuItem>
                         </>
                       )}
                     </DropdownMenuContent>
@@ -461,6 +503,49 @@ export default function Documents({ archivedView = false }) {
               <Send size={14} />
             </Button>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* PDF Preview Dialog */}
+      <Dialog open={!!previewDoc} onOpenChange={(o) => !o && closePreview()}>
+        <DialogContent className="sm:max-w-5xl h-[85vh] flex flex-col p-0 gap-0">
+          <DialogHeader className="p-4 border-b border-gray-100">
+            <div className="flex items-center justify-between gap-3 pr-8">
+              <div className="min-w-0">
+                <DialogTitle className="truncate">{previewDoc?.title}</DialogTitle>
+                <DialogDescription className="truncate text-xs">{previewDoc?.original_filename}</DialogDescription>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => previewDoc && downloadDoc(previewDoc)}
+                  data-testid="preview-download"
+                >
+                  <Download size={14} className="mr-1" /> Télécharger
+                </Button>
+                <Button
+                  onClick={printPreview}
+                  size="sm"
+                  className="bg-[#0f4c3a] hover:bg-[#1a6b53] text-white"
+                  data-testid="preview-print"
+                >
+                  <Printer size={14} className="mr-1" /> Imprimer
+                </Button>
+              </div>
+            </div>
+          </DialogHeader>
+          <div className="flex-1 bg-gray-100 overflow-hidden">
+            {previewUrl && (
+              <iframe
+                id="pdf-preview-frame"
+                src={previewUrl}
+                title="Aperçu du document"
+                className="w-full h-full border-0"
+                data-testid="preview-iframe"
+              />
+            )}
+          </div>
         </DialogContent>
       </Dialog>
     </div>

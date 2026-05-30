@@ -3,11 +3,6 @@ import axios from "axios";
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 export const API = `${BACKEND_URL}/api`;
 
-export const LOGO_URL =
-  "https://customer-assets.emergentagent.com/job_ada3efd6-4e4c-4295-902b-4abf286154c2/artifacts/dmk2iip2_Photo%201.jpeg";
-export const HERO_URL =
-  "https://customer-assets.emergentagent.com/job_ada3efd6-4e4c-4295-902b-4abf286154c2/artifacts/15pprz55_Photo%202.jpeg";
-
 const api = axios.create({
   baseURL: API,
   withCredentials: true,

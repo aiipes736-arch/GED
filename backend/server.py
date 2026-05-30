@@ -308,7 +308,9 @@ async def delete_user(user_id: str, user: dict = Depends(current_user_dep)):
 # ===================== Folders =====================
 @api.get("/folders", response_model=List[FolderOut])
 async def list_folders(user: dict = Depends(current_user_dep)):
-    cursor = db.folders.find({}, {"_id": 0}).sort("created_at", -1)
+    # Agents see only their own folders; admin sees everything
+    q = {} if user.get("role") == "admin" else {"created_by": user["id"]}
+    cursor = db.folders.find(q, {"_id": 0}).sort("created_at", -1)
     return await cursor.to_list(length=1000)
 
 
@@ -338,6 +340,8 @@ async def update_folder(folder_id: str, body: FolderUpdate, user: dict = Depends
     folder = await db.folders.find_one({"id": folder_id})
     if not folder:
         raise HTTPException(status_code=404, detail="Dossier introuvable")
+    if not _can_modify_folder(folder, user):
+        raise HTTPException(status_code=403, detail="Seul l'administrateur peut modifier un dossier")
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if updates:
         await db.folders.update_one({"id": folder_id}, {"$set": updates})
@@ -351,6 +355,8 @@ async def delete_folder(folder_id: str, user: dict = Depends(current_user_dep)):
     folder = await db.folders.find_one({"id": folder_id})
     if not folder:
         raise HTTPException(status_code=404, detail="Dossier introuvable")
+    if not _can_modify_folder(folder, user):
+        raise HTTPException(status_code=403, detail="Seul l'administrateur peut supprimer un dossier")
     # Detach documents from the folder rather than deleting them
     await db.documents.update_many({"folder_id": folder_id}, {"$set": {"folder_id": None}})
     await db.folders.delete_one({"id": folder_id})
@@ -378,6 +384,16 @@ def _has_access(doc: dict, user: dict) -> bool:
     if user["id"] in doc.get("shared_with", []):
         return True
     return False
+
+
+def _can_modify_doc(doc: dict, user: dict) -> bool:
+    """Only admins can modify/delete/share/archive documents."""
+    return user.get("role") == "admin"
+
+
+def _can_modify_folder(folder: dict, user: dict) -> bool:
+    """Only admins can modify/delete folders."""
+    return user.get("role") == "admin"
 
 
 @api.post("/documents")
@@ -491,8 +507,8 @@ async def update_document(doc_id: str, body: DocumentUpdate, user: dict = Depend
     d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
     if not d:
         raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _has_access(d, user):
-        raise HTTPException(status_code=403, detail="Accès refusé")
+    if not _can_modify_doc(d, user):
+        raise HTTPException(status_code=403, detail="Seul l'administrateur peut modifier un document")
     updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
     if updates:
         await db.documents.update_one({"id": doc_id}, {"$set": updates})
@@ -506,8 +522,8 @@ async def delete_document(doc_id: str, user: dict = Depends(current_user_dep)):
     d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
     if not d:
         raise HTTPException(status_code=404, detail="Document introuvable")
-    if user.get("role") != "admin" and d.get("uploaded_by") != user["id"]:
-        raise HTTPException(status_code=403, detail="Seul l'auteur ou l'administrateur peut supprimer")
+    if not _can_modify_doc(d, user):
+        raise HTTPException(status_code=403, detail="Seul l'administrateur peut supprimer un document")
     await db.documents.update_one({"id": doc_id}, {"$set": {"is_deleted": True, "deleted_at": now_iso()}})
     await log_activity(user["id"], user["name"], "document_deleted", f"Document supprimé: {d['title']}", "document", doc_id)
     return {"message": "Document supprimé"}
@@ -518,8 +534,8 @@ async def archive_document(doc_id: str, user: dict = Depends(current_user_dep)):
     d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
     if not d:
         raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _has_access(d, user):
-        raise HTTPException(status_code=403, detail="Accès refusé")
+    if not _can_modify_doc(d, user):
+        raise HTTPException(status_code=403, detail="Seul l'administrateur peut archiver un document")
     await db.documents.update_one(
         {"id": doc_id},
         {"$set": {"is_archived": True, "archived_at": now_iso()}},
@@ -533,8 +549,8 @@ async def unarchive_document(doc_id: str, user: dict = Depends(current_user_dep)
     d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
     if not d:
         raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _has_access(d, user):
-        raise HTTPException(status_code=403, detail="Accès refusé")
+    if not _can_modify_doc(d, user):
+        raise HTTPException(status_code=403, detail="Seul l'administrateur peut désarchiver un document")
     await db.documents.update_one(
         {"id": doc_id},
         {"$set": {"is_archived": False, "archived_at": None}},
@@ -548,8 +564,8 @@ async def share_document(doc_id: str, body: ShareIn, user: dict = Depends(curren
     d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
     if not d:
         raise HTTPException(status_code=404, detail="Document introuvable")
-    if user.get("role") != "admin" and d.get("uploaded_by") != user["id"]:
-        raise HTTPException(status_code=403, detail="Seul l'auteur ou l'admin peut partager")
+    if not _can_modify_doc(d, user):
+        raise HTTPException(status_code=403, detail="Seul l'administrateur peut partager un document")
     prev = set(d.get("shared_with", []))
     new_ids = set(body.user_ids)
     added = new_ids - prev
@@ -560,11 +576,88 @@ async def share_document(doc_id: str, body: ShareIn, user: dict = Depends(curren
             user_id=uid,
             title="Document partagé avec vous",
             message=f"{user.get('name', 'Un agent')} vous a partagé « {d['title']} »",
-            link="/documents",
+            link="/inbox",
             actor_name=user.get("name", ""),
         )
     await log_activity(user["id"], user["name"], "document_shared", f"Document partagé: {d['title']}", "document", doc_id)
     return {"message": "Document partagé", "shared_with": body.user_ids}
+
+
+    await log_activity(user["id"], user["name"], "document_shared", f"Document partagé: {d['title']}", "document", doc_id)
+    return {"message": "Document partagé", "shared_with": body.user_ids}
+
+
+# ===================== Settings (logo / hero image) =====================
+DEFAULT_LOGO_URL = "https://customer-assets.emergentagent.com/job_ada3efd6-4e4c-4295-902b-4abf286154c2/artifacts/dmk2iip2_Photo%201.jpeg"
+DEFAULT_HERO_URL = "https://customer-assets.emergentagent.com/job_ada3efd6-4e4c-4295-902b-4abf286154c2/artifacts/15pprz55_Photo%202.jpeg"
+
+
+async def _get_settings_doc() -> dict:
+    doc = await db.settings.find_one({"_id": "app"})
+    if not doc:
+        return {"logo_url": DEFAULT_LOGO_URL, "hero_url": DEFAULT_HERO_URL}
+    return {
+        "logo_url": doc.get("logo_url") or DEFAULT_LOGO_URL,
+        "hero_url": doc.get("hero_url") or DEFAULT_HERO_URL,
+    }
+
+
+@api.get("/settings")
+async def get_settings():
+    """Public endpoint so the login screen can fetch the logo + hero."""
+    return await _get_settings_doc()
+
+
+@api.post("/settings/logo")
+async def update_logo(file: UploadFile = File(...), user: dict = Depends(current_user_dep)):
+    require_admin(user)
+    data = await file.read()
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png"
+    path = f"{os.environ.get('APP_NAME', 'mhcged')}/settings/logo-{uuid.uuid4()}.{ext}"
+    content_type = file.content_type or "image/png"
+    try:
+        result = storage.put_object(path, data, content_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur upload: {e}")
+    public_url = f"/api/settings/file/{result['path']}"
+    await db.settings.update_one(
+        {"_id": "app"},
+        {"$set": {"logo_url": public_url, "logo_path": result["path"], "updated_at": now_iso()}},
+        upsert=True,
+    )
+    await log_activity(user["id"], user["name"], "logo_updated", "Logo mis à jour", "settings", "logo")
+    return await _get_settings_doc()
+
+
+@api.post("/settings/hero")
+async def update_hero(file: UploadFile = File(...), user: dict = Depends(current_user_dep)):
+    require_admin(user)
+    data = await file.read()
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png"
+    path = f"{os.environ.get('APP_NAME', 'mhcged')}/settings/hero-{uuid.uuid4()}.{ext}"
+    content_type = file.content_type or "image/png"
+    try:
+        result = storage.put_object(path, data, content_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur upload: {e}")
+    public_url = f"/api/settings/file/{result['path']}"
+    await db.settings.update_one(
+        {"_id": "app"},
+        {"$set": {"hero_url": public_url, "hero_path": result["path"], "updated_at": now_iso()}},
+        upsert=True,
+    )
+    await log_activity(user["id"], user["name"], "hero_updated", "Image d'accueil mise à jour", "settings", "hero")
+    return await _get_settings_doc()
+
+
+@api.get("/settings/file/{path:path}")
+async def settings_file(path: str):
+    """Serve the uploaded logo/hero images publicly (no auth required for login screen)."""
+    try:
+        data, ct = storage.get_object(path)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Image introuvable")
+    return Response(content=data, media_type=ct)
 
 
 # ===================== Tags =====================

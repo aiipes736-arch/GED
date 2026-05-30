@@ -1,0 +1,43 @@
+{
+  "summary": "Phase 1 testing — Settings (logo/hero upload, public GET, image serving), strict admin-only write permissions on folders/documents, agent isolation on folder & document lists, and frontend (Dashboard quick tiles + logout, /settings admin gating, agent /settings redirect, Documents admin vs agent menus, PDF preview dialog, Folders edit/delete gating). Backend: 15/15 pytest PASS in /app/backend/tests/test_phase1_settings_permissions.py. Frontend Playwright: ALL flows green EXCEPT one bug — agents still see folder-edit-{id} and folder-delete-{id} buttons on /folders (UI guard missing). PDF preview iframe, print, download all confirmed working (initial false-negative was a 1.2s wait race; with 3s wait all three render correctly).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "Folders page (/app/frontend/src/pages/Folders.jsx lines 285-301)",
+        "issue": "Agent role still sees folder-edit-{id} and folder-delete-{id} buttons. isAdmin is computed at line 40 but never used to gate the edit/delete <Button> elements. Spec requires only folder-add-child-{id} for non-admins. Backend correctly returns 403 if clicked, but UI must hide them.",
+        "selector": "[data-testid^=\"folder-edit-\"] and [data-testid^=\"folder-delete-\"]",
+        "priority": "HIGH"
+      }
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase1_settings_permissions.py",
+    "/app/test_reports/pytest/pytest_phase1.xml"
+  ],
+  "action_items": [
+    "Wrap the folder-edit and folder-delete <Button> elements in Folders.jsx (around lines 285-301) inside `{isAdmin && ( ... )}` so agents only see folder-add-child-{id}. (The isAdmin variable is already declared at line 40 but unused for these buttons.)"
+  ],
+  "critical_code_review_comments": [
+    "server.py is now 1206 lines (was 1112 in iter-6). Still mixes 9+ feature areas. Strongly recommend splitting into routers/ modules (auth, users, folders, documents, settings, messages, comments, inbox, announcements, reports). Maintenance cost keeps growing.",
+    "GET /api/settings is correctly public (no auth dep) — good. But /api/settings/file/{path} also has no auth and no rate-limit. Since paths embed a UUID, enumeration is hard, but consider adding Cache-Control: public, max-age=86400 headers so login screens don't hammer the API on every refresh.",
+    "POST /api/settings/logo and /api/settings/hero do NOT validate file mime-type or size. An admin could upload a 100MB binary or non-image file. Recommend: assert content_type.startswith('image/'), assert len(data) < 5*1024*1024.",
+    "DEFAULT_LOGO_URL and DEFAULT_HERO_URL are hard-coded customer-assets URLs in server.py — move to env vars (e.g. SETTINGS_DEFAULT_LOGO_URL) so they can be swapped per environment without code changes.",
+    "_can_modify_doc and _can_modify_folder are now identical (admin-only). Consider extracting a single is_admin(user) helper to avoid divergence, and reuse the existing require_admin() guard.",
+    "list_documents enforces isolation via $and merge with $or — correct, but combined with search the resulting query is complex. Consider helper build_doc_query(user, ...) for clarity and future audit.",
+    "Frontend Folders.jsx has an unused `isAdmin` variable (line 40) — eslint should flag this. Enable @typescript-eslint/no-unused-vars or equivalent on .jsx files to catch this class of bug early.",
+    "SettingsContext.jsx fetches /api/settings on mount but does not re-fetch after admin upload — the dynamic logo on Sidebar may show stale until full reload. Consider exposing a refresh() and calling it from Settings.jsx after successful upload."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_phase1_settings_permissions.py (new — 15 tests covering settings + permissions + isolation)"
+  ],
+  "success_rate": {"backend": "100% (15/15 phase1 tests)", "frontend": "94% (16/17 verified flows; agent folder edit/delete buttons NOT hidden — 1 UI guard bug)"},
+  "test_credentials": "admin@mhcged.cg / Admin@2026 (verified). Test agents created and cleaned up: TEST_phase1_agent_*@example.com (backend), uitest_phase1_*@example.com (frontend, deleted at end).",
+  "seed_data_creation": "Backend tests create+delete TEST_PHASE1_* documents and folders + one agent per module. Frontend test created+deleted one UI agent and a few TEST_UI_* PDFs/documents (cleaned up via /api/documents DELETE).",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Phase 1 backend is fully green. Re-test only Folders.jsx after the isAdmin guard is added — verify with agent that folder-edit-{id} and folder-delete-{id} are NOT in the DOM, while folder-add-child-{id} is. All other selectors are verified: settings-page, logo-input/submit/current, hero-input/submit/current, dashboard-logout, quick-tiles, tile-{documents,folders,inbox,messages,announcements,agents,reports,settings}, nav-settings (admin only), preview-iframe (PDF preview), preview-print, preview-download. Agent /settings correctly redirects to /. Agent document menu correctly hides edit/delete/share/archive while keeping download/preview-pdf/comments.",
+  "rca_of_the_issue": "Folders.jsx defines `const isAdmin = user?.role === \"admin\"` at line 40 but never references isAdmin inside the JSX. Lines 285-301 unconditionally render two <Button> components with data-testid `folder-edit-{id}` and `folder-delete-{id}`. Reproduction: login as any agent, visit /folders, open a folder card you created, hover over it — both Pencil (edit) and Trash2 (delete) icons appear next to the Plus (add-child). Mitigation: wrap both buttons in `{isAdmin && (<>...</>)}` (or only the edit, then only the delete) so agents only see add-child. Backend already returns 403 on PUT/DELETE so security is intact — this is purely a UI/UX consistency fix."
+}
