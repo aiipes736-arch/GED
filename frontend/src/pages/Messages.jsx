@@ -369,9 +369,9 @@ export default function Messages() {
                         <div className={`flex items-center gap-1.5 mt-1 text-[10px] ${mine ? "text-white/60 justify-end" : "text-gray-400"}`}>
                           <span>{formatDate(m.created_at)}</span>
                           {mine && (m.is_read ? (
-                            <CheckCheck size={11} className="text-emerald-300" data-testid={`msg-read-${m.id}`} />
+                            <CheckCheck size={11} className="text-white" data-testid={`msg-read-${m.id}`} />
                           ) : (
-                            <Check size={11} data-testid={`msg-sent-${m.id}`} />
+                            <Check size={11} className="text-white/60" data-testid={`msg-sent-${m.id}`} />
                           ))}
                         </div>
                         {mine && (

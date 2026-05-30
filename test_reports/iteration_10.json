@@ -1,0 +1,37 @@
+{
+  "summary": "Iteration 10 — Backend-only retest of MHCGED messaging fixes. All 5 fixes from iteration 9 follow-up verified GREEN. Added 3 new security tests for attachment-access enforcement (FIX 4). pytest /app/backend/tests/test_messaging_new.py: 20/20 PASS (was 14/17 in iter9). All three previously failing tests (deleted_msg_not_in_conversation, unread_count_excludes_deleted, thread_search_filter) now pass. Security: non-admin sender attempting to attach a doc they don't own/aren't shared with is correctly rejected with 403 'Vous n'avez pas accès à ce document' on both /api/messages and /api/messages/broadcast, and the doc is NOT leaked into recipient's inbox. Regression suite (auto-share, delete authz, broadcast validation, conv search, read receipts) all still pass. Frontend retest skipped per request (cosmetic icon color change only).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "tests_executed": [
+    {"step": "pytest backend/tests/test_messaging_new.py (20 tests, includes 3 new security tests)", "result": "20/20 PASS", "details": "FIX 1 deleted_msg_not_in_conversation ✓, FIX 2 thread_search_filter ✓, FIX 3 unread_count_excludes_deleted ✓, FIX 4 non_admin_cannot_attach_doc_without_access ✓, non_admin_cannot_broadcast_doc_without_access ✓, non_admin_can_attach_doc_already_shared_with_them ✓ (regression for legitimate flow). All 14 previously-passing tests still pass."}
+  ],
+  "test_report_links": [
+    "/app/backend/tests/test_messaging_new.py",
+    "/app/test_reports/pytest/pytest_messaging_new.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py L1110-1129 get_conversation now correctly filters is_deleted and applies search regex — consistent with list_conversations. Good.",
+    "server.py L1132-1139 messages_unread_count now excludes is_deleted — consistent.",
+    "server.py L925-933 and L994-1001 sender access check is enforced via role==admin OR uploaded_by==self OR id in shared_with — correct privilege model. Side-effect-free 403 before any DB write — good (no leak).",
+    "Minor: search query uses raw user input as regex pattern (server.py L1120). If a user passes special regex chars like '(' the query will 500. Consider re.escape(search). Same applies to list_conversations if it doesn't already escape. Not blocking; low severity.",
+    "Note: thread search runs case-insensitive substring match across the user's entire conversation with peer — fine for current scale (length=1000 cap)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_messaging_new.py (added TestAttachmentAccessSecurity class with 3 tests)"
+  ],
+  "success_rate": {"backend": "100% (20/20)", "frontend": "n/a (skipped by request)"},
+  "test_credentials": "admin@mhcged.cg / Admin@2026 (verified)",
+  "seed_data_creation": "Transient TEST_uitest_msg_* agent users and TEST_AUTO_/TEST_BCAST_/TEST_SEC_/TEST_SECBC_/TEST_OKSEC_ docs created and cleaned up per-test via fixture teardown.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All 5 messaging fixes are GREEN. test_messaging_new.py now has 20 tests including 3 new security tests covering attachment-access enforcement. If main agent escapes regex special chars in search input (server.py L1120) that would be a nice hardening — not blocking. No retest needed.",
+  "rca_of_the_issue": "All three iter9 bugs were missing filters in messaging endpoints: get_conversation lacked both is_deleted and search filter; unread-count lacked is_deleted. FIX added in this iter: server.py L1113-1120 (is_deleted + search regex) and L1137 (is_deleted in unread count). Security FIX 4 added explicit sender_has_access check before processing attachment_doc_id in both /api/messages (L925-933) and /api/messages/broadcast (L994-1001), raising 403 with French message when sender is not admin AND not uploader AND not in shared_with."
+}

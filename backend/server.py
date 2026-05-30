@@ -923,6 +923,14 @@ async def send_message(body: MessageCreate, user: dict = Depends(current_user_de
             {"_id": 0, "id": 1, "title": 1, "original_filename": 1, "shared_with": 1, "uploaded_by": 1},
         )
         if d:
+            # Security: sender must own the doc, admin, or already have access (shared_with)
+            sender_has_access = (
+                user.get("role") == "admin"
+                or d.get("uploaded_by") == user["id"]
+                or user["id"] in (d.get("shared_with") or [])
+            )
+            if not sender_has_access:
+                raise HTTPException(status_code=403, detail="Vous n'avez pas accès à ce document")
             attachment = {"id": d["id"], "title": d["title"], "original_filename": d["original_filename"]}
             # Auto-share: grant the recipient access to the attached document
             shared = set(d.get("shared_with", []) or [])
@@ -984,6 +992,13 @@ async def broadcast_message(body: MessageBroadcast, user: dict = Depends(current
             {"_id": 0, "id": 1, "title": 1, "original_filename": 1, "shared_with": 1, "uploaded_by": 1},
         )
         if d:
+            sender_has_access = (
+                user.get("role") == "admin"
+                or d.get("uploaded_by") == user["id"]
+                or user["id"] in (d.get("shared_with") or [])
+            )
+            if not sender_has_access:
+                raise HTTPException(status_code=403, detail="Vous n'avez pas accès à ce document")
             attachment = {"id": d["id"], "title": d["title"], "original_filename": d["original_filename"]}
             shared = set(d.get("shared_with", []) or [])
             new_shared = shared.union(uid for uid in valid_ids if uid != d.get("uploaded_by"))
@@ -1093,13 +1108,17 @@ async def list_conversations(search: Optional[str] = Query(None), user: dict = D
 
 
 @api.get("/messages/conversation/{peer_id}")
-async def get_conversation(peer_id: str, user: dict = Depends(current_user_dep)):
-    cursor = db.messages.find({
+async def get_conversation(peer_id: str, search: Optional[str] = Query(None), user: dict = Depends(current_user_dep)):
+    q: dict = {
+        "is_deleted": {"$ne": True},
         "$or": [
             {"from_user_id": user["id"], "to_user_id": peer_id},
             {"from_user_id": peer_id, "to_user_id": user["id"]},
-        ]
-    }, {"_id": 0}).sort("created_at", 1)
+        ],
+    }
+    if search:
+        q["content"] = {"$regex": search, "$options": "i"}
+    cursor = db.messages.find(q, {"_id": 0}).sort("created_at", 1)
     msgs = await cursor.to_list(length=1000)
     # Mark as read everything received
     await db.messages.update_many(
@@ -1112,7 +1131,11 @@ async def get_conversation(peer_id: str, user: dict = Depends(current_user_dep))
 
 @api.get("/messages/unread-count")
 async def messages_unread_count(user: dict = Depends(current_user_dep)):
-    n = await db.messages.count_documents({"to_user_id": user["id"], "is_read": False})
+    n = await db.messages.count_documents({
+        "to_user_id": user["id"],
+        "is_read": False,
+        "is_deleted": {"$ne": True},
+    })
     return {"unread_count": n}
 
 

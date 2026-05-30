@@ -253,6 +253,63 @@ class TestSearch:
             f"Thread search should filter — got non-matching content: {contents}"
 
 
+# ============== SECURITY: attachment access ==============
+class TestAttachmentAccessSecurity:
+    def test_non_admin_cannot_attach_doc_without_access(self, admin, two_agents, agent_a, agent_b):
+        """Agent A should NOT be able to attach a doc they don't own/aren't shared with."""
+        # Admin uploads a private doc (only admin owns it)
+        files = {"file": ("sec.txt", b"secret", "text/plain")}
+        data = {"title": f"TEST_SEC_{uuid.uuid4().hex[:6]}"}
+        up = admin.post(f"{BASE_URL}/api/documents", files=files, data=data, timeout=20).json()
+        try:
+            # Agent A tries to send to Agent B with this doc attached
+            r = agent_a.post(f"{BASE_URL}/api/messages", json={
+                "to_user_id": two_agents[1]["id"],
+                "content": "leak attempt",
+                "attachment_doc_id": up["id"],
+            }, timeout=15)
+            assert r.status_code == 403, f"Expected 403, got {r.status_code}: {r.text}"
+            assert "n'avez pas accès" in r.json().get("detail", "")
+            # Verify agent_b did NOT get auto-shared access
+            ib_b = agent_b.get(f"{BASE_URL}/api/inbox", timeout=10).json()
+            assert up["id"] not in [d["id"] for d in ib_b["items"]], "Doc was leaked despite 403"
+        finally:
+            admin.delete(f"{BASE_URL}/api/documents/{up['id']}", timeout=10)
+
+    def test_non_admin_cannot_broadcast_doc_without_access(self, admin, two_agents, agent_a, agent_b):
+        files = {"file": ("secb.txt", b"secretbc", "text/plain")}
+        data = {"title": f"TEST_SECBC_{uuid.uuid4().hex[:6]}"}
+        up = admin.post(f"{BASE_URL}/api/documents", files=files, data=data, timeout=20).json()
+        try:
+            r = agent_a.post(f"{BASE_URL}/api/messages/broadcast", json={
+                "to_user_ids": [two_agents[1]["id"]],
+                "content": "bc leak",
+                "attachment_doc_id": up["id"],
+            }, timeout=15)
+            assert r.status_code == 403, f"Expected 403, got {r.status_code}: {r.text}"
+            assert "n'avez pas accès" in r.json().get("detail", "")
+        finally:
+            admin.delete(f"{BASE_URL}/api/documents/{up['id']}", timeout=10)
+
+    def test_non_admin_can_attach_doc_already_shared_with_them(self, admin, two_agents, agent_a, agent_b):
+        """If admin shares a doc with agent_a, agent_a can then forward it to agent_b."""
+        files = {"file": ("ok.txt", b"ok", "text/plain")}
+        data = {"title": f"TEST_OKSEC_{uuid.uuid4().hex[:6]}"}
+        up = admin.post(f"{BASE_URL}/api/documents", files=files, data=data, timeout=20).json()
+        try:
+            # Admin shares with agent_a via direct message
+            admin.post(f"{BASE_URL}/api/messages", json={
+                "to_user_id": two_agents[0]["id"], "content": "for you", "attachment_doc_id": up["id"]
+            }, timeout=15)
+            # Now agent_a (already in shared_with) should be allowed to attach it to agent_b
+            r = agent_a.post(f"{BASE_URL}/api/messages", json={
+                "to_user_id": two_agents[1]["id"], "content": "forwarded", "attachment_doc_id": up["id"]
+            }, timeout=15)
+            assert r.status_code == 200, r.text
+        finally:
+            admin.delete(f"{BASE_URL}/api/documents/{up['id']}", timeout=10)
+
+
 # ============== READ RECEIPTS ==============
 class TestReadReceipts:
     def test_read_receipt_flow(self, admin, two_agents, agent_a):
