@@ -41,13 +41,15 @@ Développer une Gestion Électronique des Documents (GED) professionnelle sécur
 - All tests passing: 38/38 backend + 100% frontend (notifications, folders hierarchy, password reset, monthly reports)
 - New dependency: `reportlab==4.5.0` for PDF generation
 
-## What's Been Implemented (2026-05-03 — communication suite)
-- **Private messaging** (`/messages`): conversation list, thread view, optional document attachment, unread badges, auto-notification on new message
-- **Document discussions**: "Commentaires" action in document kebab opens dialog with thread; commenter notifies the document owner
-- **Inbox** (`/inbox`): documents shared with the current user, "Nouveau" badge, mark-as-read + download, separate from main Documents list
-- **Broadcast announcements** (`/announcements`): admin-only create dialog with optional expiration; banner on Dashboard; broadcast notification to all active users
-- New backend endpoints: `/api/messages*`, `/api/documents/{id}/comments`, `/api/comments/{id}`, `/api/inbox*`, `/api/announcements*`
-- Tests: **64/64 backend** (auth + CRUD + folders + notifications + reports + communication) + 100% frontend
+## What's Been Implemented (2026-05-30 — Phase 1 institutional controls)
+- **Page Paramètres** (admin) : upload du **logo** et de l'**image d'accueil** via Emergent Object Storage, servis publiquement via `/api/settings/file/{path}` ; validation MIME image + taille < 5 Mo ; SettingsContext propagé partout (Login, Sidebar) avec refresh automatique
+- **Permissions strictes** : seul l'admin peut modifier / supprimer / archiver / partager des documents ET des dossiers. Les agents peuvent uniquement **uploader** des documents et créer des dossiers
+- **Isolation totale** : chaque agent ne voit que ses propres dossiers + ses propres documents (uploaded_by) + les documents que l'admin a partagés avec lui. L'admin voit tout
+- **Aperçu PDF + Impression** : nouvelle action « Aperçu / Impression » dans le menu de chaque document PDF ; dialog plein écran avec iframe + boutons Imprimer (window.print) et Télécharger
+- **Accès rapides Dashboard** : grille de tuiles cliquables (Documents, Dossiers, Boîte de réception, Messagerie, Annonces ; Agents/Rapports/Paramètres en plus pour l'admin) + bouton « Se déconnecter » en haut à droite
+- Endpoints ajoutés : `GET /api/settings` (public), `POST /api/settings/logo`, `POST /api/settings/hero`, `GET /api/settings/file/{path}`
+- Tests : 15/15 backend Phase 1 + 17/17 frontend Phase 1 (validation après fix du guard `isAdmin` sur Folders.jsx)
+- Cumul total : **79/79 tests backend** + 100% frontend
 
 ## Backlog / Next Tasks
 - P1: Prévisualisation documents (PDF viewer inline)
