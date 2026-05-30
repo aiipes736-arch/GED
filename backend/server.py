@@ -139,6 +139,12 @@ class MessageCreate(BaseModel):
     attachment_doc_id: Optional[str] = None
 
 
+class MessageBroadcast(BaseModel):
+    to_user_ids: List[str]
+    content: str
+    attachment_doc_id: Optional[str] = None
+
+
 class CommentCreate(BaseModel):
     content: str
 
@@ -914,10 +920,18 @@ async def send_message(body: MessageCreate, user: dict = Depends(current_user_de
     if body.attachment_doc_id:
         d = await db.documents.find_one(
             {"id": body.attachment_doc_id, "is_deleted": False},
-            {"_id": 0, "id": 1, "title": 1, "original_filename": 1},
+            {"_id": 0, "id": 1, "title": 1, "original_filename": 1, "shared_with": 1, "uploaded_by": 1},
         )
         if d:
-            attachment = d
+            attachment = {"id": d["id"], "title": d["title"], "original_filename": d["original_filename"]}
+            # Auto-share: grant the recipient access to the attached document
+            shared = set(d.get("shared_with", []) or [])
+            if body.to_user_id not in shared and d.get("uploaded_by") != body.to_user_id:
+                shared.add(body.to_user_id)
+                await db.documents.update_one(
+                    {"id": d["id"]},
+                    {"$set": {"shared_with": list(shared)}},
+                )
     msg = {
         "id": str(uuid.uuid4()),
         "from_user_id": user["id"],
@@ -927,6 +941,7 @@ async def send_message(body: MessageCreate, user: dict = Depends(current_user_de
         "content": body.content,
         "attachment": attachment,
         "is_read": False,
+        "is_deleted": False,
         "created_at": now_iso(),
     }
     await db.messages.insert_one(msg)
@@ -941,11 +956,93 @@ async def send_message(body: MessageCreate, user: dict = Depends(current_user_de
     return msg
 
 
+@api.post("/messages/broadcast")
+async def broadcast_message(body: MessageBroadcast, user: dict = Depends(current_user_dep)):
+    """Send the same message to multiple recipients (creates one message per recipient)."""
+    if not body.content.strip() and not body.attachment_doc_id:
+        raise HTTPException(status_code=400, detail="Message vide")
+    if not body.to_user_ids:
+        raise HTTPException(status_code=400, detail="Au moins un destinataire requis")
+    # Filter out self and validate ObjectIds
+    valid_ids: List[str] = []
+    for uid in body.to_user_ids:
+        if uid == user["id"]:
+            continue
+        try:
+            ObjectId(uid)
+        except Exception:
+            continue
+        valid_ids.append(uid)
+    if not valid_ids:
+        raise HTTPException(status_code=400, detail="Aucun destinataire valide")
+
+    # Resolve doc + auto-share with all recipients
+    attachment = None
+    if body.attachment_doc_id:
+        d = await db.documents.find_one(
+            {"id": body.attachment_doc_id, "is_deleted": False},
+            {"_id": 0, "id": 1, "title": 1, "original_filename": 1, "shared_with": 1, "uploaded_by": 1},
+        )
+        if d:
+            attachment = {"id": d["id"], "title": d["title"], "original_filename": d["original_filename"]}
+            shared = set(d.get("shared_with", []) or [])
+            new_shared = shared.union(uid for uid in valid_ids if uid != d.get("uploaded_by"))
+            if new_shared != shared:
+                await db.documents.update_one({"id": d["id"]}, {"$set": {"shared_with": list(new_shared)}})
+
+    # Fetch recipient names in one query
+    oids = [ObjectId(uid) for uid in valid_ids]
+    users_cursor = db.users.find({"_id": {"$in": oids}}, {"_id": 1, "name": 1})
+    name_by_id = {str(u["_id"]): u.get("name", "") async for u in users_cursor}
+
+    created = 0
+    for uid in valid_ids:
+        if uid not in name_by_id:
+            continue
+        msg = {
+            "id": str(uuid.uuid4()),
+            "from_user_id": user["id"],
+            "from_user_name": user.get("name", ""),
+            "to_user_id": uid,
+            "to_user_name": name_by_id[uid],
+            "content": body.content,
+            "attachment": attachment,
+            "is_read": False,
+            "is_deleted": False,
+            "created_at": now_iso(),
+        }
+        await db.messages.insert_one(msg)
+        await create_notification(
+            user_id=uid,
+            title="Nouveau message",
+            message=f"{user.get('name', 'Un agent')} vous a envoyé un message",
+            link="/messages",
+            actor_name=user.get("name", ""),
+        )
+        created += 1
+    await log_activity(user["id"], user["name"], "message_broadcast", f"Message diffusé à {created} agent(s)", "message", "")
+    return {"sent": created}
+
+
+@api.delete("/messages/{message_id}")
+async def delete_message(message_id: str, user: dict = Depends(current_user_dep)):
+    m = await db.messages.find_one({"id": message_id})
+    if not m:
+        raise HTTPException(status_code=404, detail="Message introuvable")
+    if user.get("role") != "admin" and m.get("from_user_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Vous ne pouvez supprimer que vos propres messages")
+    await db.messages.update_one({"id": message_id}, {"$set": {"is_deleted": True, "deleted_at": now_iso()}})
+    return {"message": "Message supprimé"}
+
+
 @api.get("/messages/conversations")
-async def list_conversations(user: dict = Depends(current_user_dep)):
+async def list_conversations(search: Optional[str] = Query(None), user: dict = Depends(current_user_dep)):
     """Return list of conversations with last message + unread count for current user."""
     pipeline = [
-        {"$match": {"$or": [{"from_user_id": user["id"]}, {"to_user_id": user["id"]}]}},
+        {"$match": {
+            "$or": [{"from_user_id": user["id"]}, {"to_user_id": user["id"]}],
+            "is_deleted": {"$ne": True},
+        }},
         {"$sort": {"created_at": -1}},
         {
             "$group": {
@@ -984,6 +1081,14 @@ async def list_conversations(user: dict = Depends(current_user_dep)):
             "last_message": last,
             "unread_count": c["unread_count"],
         })
+    # Filter by search term (peer name or last message content, case-insensitive)
+    if search:
+        s = search.lower().strip()
+        out = [
+            c for c in out
+            if s in (c["peer"]["name"] or "").lower()
+            or s in (c["last_message"].get("content") or "").lower()
+        ]
     return out
 
 
@@ -1213,3 +1318,4 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+

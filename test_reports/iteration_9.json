@@ -1,0 +1,50 @@
+{
+  "summary": "Iteration 9 — Tested 5 new MHCGED messaging features (auto-share, delete, broadcast, search, read receipts). Backend pytest: 14/17 PASS, 3 FAIL — all 3 failures are real bugs in get_conversation/unread-count which do NOT honor is_deleted nor the ?search= query parameter despite the spec calling for both. Frontend smoke test: all data-testids present and functional; broadcast dialog round-trip works, conv-search works, msg-sent/msg-read indicators render, but thread-search input does NOT filter messages (because backend ignores ?search= for conversation/{peer}).",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "GET /api/messages/conversation/{peer_id}", "issue": "Does NOT filter is_deleted — soft-deleted messages still appear in the thread. server.py lines 1095-1110 query has no is_deleted filter.", "priority": "HIGH"},
+      {"endpoint": "GET /api/messages/conversation/{peer_id}", "issue": "Does NOT accept ?search= query param — spec requires case-insensitive content filter; frontend Messages.jsx line 56 already passes the param but backend ignores it, so thread-search UI input is non-functional.", "priority": "HIGH"},
+      {"endpoint": "GET /api/messages/unread-count", "issue": "Does NOT exclude is_deleted messages (server.py line 1115 count_documents only filters by to_user_id + is_read). Deleted messages still inflate unread badge.", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "POST /api/messages and /api/messages/broadcast", "issue": "Auto-share grants recipient access to attached document regardless of whether sender owns/has access to that doc. As called out in the request other_misc_info, this is intentional UX but is technically a privilege-escalation vector: any logged-in user can pass any existing doc id as attachment_doc_id and force-share it with a third party they choose. Recommend restricting to docs where sender is uploader or already in shared_with."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {"flow": "Thread search", "issue": "thread-search input does not filter messages because backend ignores ?search= on /api/messages/conversation/{peer_id}. UI displays full thread even when typing a non-matching query.", "affected_selectors": ["[data-testid=\"thread-search\"]"]}
+    ],
+    "design_issues": []
+  },
+  "tests_executed": [
+    {"step": "Backend pytest test_messaging_new.py (17 tests)", "result": "14 PASS / 3 FAIL", "details": "PASS: auto-share single, auto-share broadcast, sender-delete-own, non-sender-403, admin-delete-any, last_message excludes deleted, all 5 broadcast tests, 2 conv-search tests, read receipt flow. FAIL: deleted_msg_not_in_conversation, unread_count_excludes_deleted, thread_search_filter."},
+    {"step": "Frontend smoke (Playwright)", "result": "MOSTLY PASS", "details": "All test-ids present: conv-search, broadcast-btn, broadcast-content, broadcast-attach, broadcast-submit, broadcast-check-{id} (×2), thread-search, msg-sent-{id}, msg-read-{id}, msg-delete-{id}. Broadcast dialog opens, recipients listed, content typed, submitted successfully (verified message appeared as last_message in conv list). conv-search filter works. msg-sent/msg-read icons render correctly. thread-search input ACCEPTS input but does NOT filter (backend bug)."}
+  ],
+  "test_report_links": [
+    "/app/backend/tests/test_messaging_new.py",
+    "/app/test_reports/pytest/pytest_messaging_new.xml"
+  ],
+  "action_items": [
+    "Fix get_conversation (server.py ~line 1097): add 'is_deleted': {'$ne': True} to the find() filter so soft-deleted messages don't appear in the thread.",
+    "Fix get_conversation: accept search: Optional[str] = Query(None) and AND a {'content': {'$regex': re.escape(search), '$options': 'i'}} clause when present, mirroring list_conversations.",
+    "Fix messages_unread_count (server.py line 1115): add 'is_deleted': {'$ne': True} to count_documents filter.",
+    "(Optional security hardening) Restrict auto-share to attachments the sender already owns or has access to."
+  ],
+  "critical_code_review_comments": [
+    "get_conversation and unread-count were not updated to handle is_deleted soft-delete flag, but list_conversations was — inconsistent. Same field, three endpoints, only one is correct.",
+    "Frontend Messages.jsx already passes ?search= to /messages/conversation/{peerId} (line 56-57 loadThread), so the contract is silently broken: UI sends a parameter the backend silently drops. Either implement server-side filter OR document the inconsistency and switch to client-side filter for thread.",
+    "Auto-share auto-grants shared_with to recipient without checking sender's ownership/access — a logged-in user can probe arbitrary doc ids via attachment_doc_id and grant a third-party access. Mitigated only by attachment id being random uuid, but still flagged.",
+    "msg-read-{id} (CheckCheck) icon is rendered with className 'text-emerald-300' on a dark green message bubble bg — low contrast against the dark message bubble background. Consider a lighter/white check icon for better visibility on the sender's own (dark) bubbles."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_messaging_new.py (NEW)"
+  ],
+  "success_rate": {"backend": "82% (14/17 tests pass — 3 failures are real backend bugs, NOT test issues)", "frontend": "95% (all test-ids present + interactions work, except thread-search filter which is blocked by backend bug)"},
+  "test_credentials": "admin@mhcged.cg / Admin@2026 (verified). Created/destroyed transient agent users with prefix TEST_uitest_msg_*.",
+  "seed_data_creation": "Created 2 agent users + several test docs during pytest, all cleaned up in fixture teardown. One real broadcast message 'TEST UI broadcast hello' was sent from admin to DSIC during frontend smoke (not cleaned).",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "The 3 backend failures are all the same class of bug (missing is_deleted filter and missing search param on the per-thread endpoint and unread-count). Fix is ~5 lines in /app/backend/server.py lines 1095-1116. After fix, rerun: pytest /app/backend/tests/test_messaging_new.py -v. All other features (auto-share, delete authz, broadcast validation, conv-search, read receipts) are GREEN. Frontend already passes ?search= and uses correct test-ids — no frontend changes needed for the search fix, just backend.",
+  "rca_of_the_issue": "Spec called for is_deleted and ?search= to be added to THREE endpoints: list_conversations, get_conversation, unread-count. The developer applied both changes to list_conversations only. get_conversation (server.py lines 1095-1110) still has a naive {$or:[from/to]} filter with neither is_deleted nor search. unread-count (line 1115) still has a naive {to_user_id, is_read:false} filter. Repro for is_deleted leak: POST /messages then DELETE /messages/{id} then GET /messages/conversation/{peer} → deleted message still in messages[]. Repro for search: GET /messages/conversation/{peer}?search=foo → returns all messages, not filtered. Repro for unread: send→delete→count → still incremented."
+}
