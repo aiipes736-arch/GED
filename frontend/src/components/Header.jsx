@@ -20,8 +20,8 @@ export default function Header() {
     try {
       const { data } = await api.get("/notifications");
       setData(data);
-    } catch {
-      // silent
+    } catch (err) {
+      console.error("Header.loadNotifications failed:", err);
     }
   }, []);
 
@@ -37,7 +37,9 @@ export default function Header() {
     if (!n.is_read) {
       try {
         await api.post(`/notifications/${n.id}/read`);
-      } catch {}
+      } catch (err) {
+        console.error("Header.markRead failed:", err);
+      }
       load();
     }
     if (n.link) {
@@ -50,7 +52,9 @@ export default function Header() {
     try {
       await api.post("/notifications/read-all");
       load();
-    } catch {}
+    } catch (err) {
+      console.error("Header.markAll failed:", err);
+    }
   };
 
   return (

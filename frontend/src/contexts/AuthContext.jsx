@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
+import React, { createContext, useContext, useEffect, useState, useCallback, useMemo } from "react";
 import api, { formatApiError } from "../lib/api";
 
 const AuthContext = createContext(null);
@@ -11,7 +11,11 @@ export function AuthProvider({ children }) {
     try {
       const { data } = await api.get("/auth/me");
       setUser(data);
-    } catch {
+    } catch (err) {
+      // 401 is expected when not logged in; log other errors
+      if (err.response?.status && err.response.status !== 401) {
+        console.error("AuthContext.fetchMe failed:", err);
+      }
       setUser(false);
     } finally {
       setInitialized(true);
@@ -22,7 +26,7 @@ export function AuthProvider({ children }) {
     fetchMe();
   }, [fetchMe]);
 
-  const login = async (email, password) => {
+  const login = useCallback(async (email, password) => {
     try {
       const { data } = await api.post("/auth/login", { email, password });
       setUser(data);
@@ -30,22 +34,23 @@ export function AuthProvider({ children }) {
     } catch (e) {
       return { ok: false, error: formatApiError(e.response?.data?.detail) || e.message };
     }
-  };
+  }, []);
 
-  const logout = async () => {
+  const logout = useCallback(async () => {
     try {
       await api.post("/auth/logout");
-    } catch {
-      // ignore
+    } catch (err) {
+      console.error("AuthContext.logout failed:", err);
     }
     setUser(false);
-  };
+  }, []);
 
-  return (
-    <AuthContext.Provider value={{ user, setUser, login, logout, initialized, refresh: fetchMe }}>
-      {children}
-    </AuthContext.Provider>
+  const value = useMemo(
+    () => ({ user, setUser, login, logout, initialized, refresh: fetchMe }),
+    [user, login, logout, initialized, fetchMe],
   );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth() {

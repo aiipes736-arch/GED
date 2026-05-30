@@ -490,6 +490,8 @@ async def download_document(doc_id: str, user: dict = Depends(current_user_dep))
         raise HTTPException(status_code=404, detail="Document introuvable")
     if not _has_access(d, user):
         raise HTTPException(status_code=403, detail="Accès refusé")
+    data: bytes = b""
+    ct: str = "application/octet-stream"
     try:
         data, ct = storage.get_object(d["storage_path"])
     except Exception as e:

@@ -157,6 +157,11 @@ export default function Folders() {
     return out;
   }, [edit, folders]);
 
+  const parentOptions = useMemo(
+    () => folders.filter((f) => !blockedIds.has(f.id)),
+    [folders, blockedIds],
+  );
+
   return (
     <div className="space-y-6" data-testid="folders-page">
       <div className="flex items-end justify-between">
@@ -202,13 +207,11 @@ export default function Folders() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="none">Aucun (racine)</SelectItem>
-                    {folders
-                      .filter((f) => !blockedIds.has(f.id))
-                      .map((f) => (
-                        <SelectItem key={f.id} value={f.id}>
-                          {f.name}
-                        </SelectItem>
-                      ))}
+                    {parentOptions.map((f) => (
+                      <SelectItem key={f.id} value={f.id}>
+                        {f.name}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               </div>

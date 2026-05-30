@@ -29,8 +29,8 @@ export default function Inbox() {
     try {
       await api.post(`/inbox/${d.id}/read`);
       load();
-    } catch {
-      // silent
+    } catch (err) {
+      console.error("Inbox.markRead failed:", err);
     }
   };
 

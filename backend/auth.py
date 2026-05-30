@@ -98,6 +98,7 @@ async def get_current_user(request: Request, db) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Jeton invalide")
 
+    user: Optional[dict] = None
     try:
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
     except Exception:

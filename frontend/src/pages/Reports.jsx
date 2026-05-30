@@ -34,8 +34,8 @@ export default function Reports() {
     try {
       const { data } = await api.get("/users");
       setAgents(data);
-    } catch {
-      // silent
+    } catch (err) {
+      console.error("Reports.loadAgents failed:", err);
     }
   }, []);
 
@@ -122,7 +122,7 @@ export default function Reports() {
               </SelectTrigger>
               <SelectContent>
                 {MONTHS.map((m, i) => (
-                  <SelectItem key={i} value={String(i + 1)}>
+                  <SelectItem key={m} value={String(i + 1)}>
                     {m}
                   </SelectItem>
                 ))}
