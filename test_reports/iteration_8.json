@@ -1,0 +1,32 @@
+{
+  "summary": "Targeted retest of Folders.jsx UI guard fix for agent role. Verified that the {isAdmin && (...)} wrapper around folder-edit-{id} and folder-delete-{id} buttons (Folders.jsx lines 285-305) correctly hides them for non-admin agents while admins still see all three action buttons. Test executed end-to-end against the live preview backend using Playwright.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "tests_executed": [
+    {"step": "Admin login + GET /folders", "result": "PASS", "details": "8 folder rows rendered; folder-add-child:8, folder-edit:8, folder-delete:8 (1:1:1 per row)"},
+    {"step": "Create test agent via POST /api/users (role=agent)", "result": "PASS", "details": "Agent uitest_folders_agent@example.com created, status 200"},
+    {"step": "Agent login + GET /folders (after creating one folder as agent)", "result": "PASS", "details": "1 folder row rendered; folder-add-child:1, folder-edit:0, folder-delete:0"},
+    {"step": "Hover over agent's folder row to trigger group-hover:opacity-100", "result": "PASS", "details": "After hover folder-edit:0 and folder-delete:0 still — elements NOT in DOM (not just opacity-hidden)"},
+    {"step": "Cleanup", "result": "PASS", "details": "Admin deleted TEST_UI_AgentFolderGuard + leftover TEST_UI_AGENT_F_1780162711 folders and the test agent user"}
+  ],
+  "test_report_links": [
+    "/app/backend/tests/test_phase1_settings_permissions.py (existing — not re-run, fix is frontend-only)"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Fix is correct and minimal: lines 285-305 of Folders.jsx wrap both edit and delete <Button> elements inside {isAdmin && (<>...</>)}. The isAdmin variable defined at line 40 is now actively used. Backend already enforces admin-only via _can_modify_folder, so the UI guard is purely cosmetic/UX consistency — defence-in-depth is now complete.",
+    "Minor: the agent's DELETE on their own self-created folder returned 403 (admin-only). This is the documented behaviour per Phase 1 spec but worth noting — agents creating folders that they cannot then delete may be confusing UX. Consider either (a) hiding the 'Nouveau dossier' button from agents too, or (b) allowing folder creators to delete their own empty folders. Not in scope for this iteration."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "n/a (frontend-only retest)", "frontend": "100% (1/1 targeted UI guard test PASS for both admin and agent roles)"},
+  "test_credentials": "admin@mhcged.cg / Admin@2026 (verified). Test agent created and cleaned up: uitest_folders_agent@example.com / Agent@2026Pwd (deleted at end of test).",
+  "seed_data_creation": "Created during test and deleted at end: 1 agent user (uitest_folders_agent@example.com) and 2 TEST_UI_* folders. No residual data.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Phase 1 is now fully green. Folders.jsx isAdmin guard verified for both roles. Admin: folder-add-child + folder-edit + folder-delete all present (8/8/8 on existing seed folders). Agent: only folder-add-child present, edit/delete absent from DOM even after hover. All other Phase 1 selectors (settings, dashboard tiles, document menus, PDF preview) were verified in iteration 7. Safe to move to Phase 2.",
+  "rca_of_the_issue": "Previous bug RCA (iter-7): Folders.jsx had isAdmin computed but unused — both folder-edit and folder-delete buttons rendered unconditionally. Fix applied (verified): lines 285-305 now read `{isAdmin && (<><Button .../> <Button .../></>)}` wrapping both action buttons. Verified by Playwright: admin role sees edit/delete:8 each, agent role sees edit/delete:0 each (counted before AND after hover to confirm DOM-absence, not opacity-hidden)."
+}

@@ -282,23 +282,27 @@ export default function Folders() {
                   >
                     <Plus size={14} />
                   </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    onClick={() => openEdit(folder)}
-                    data-testid={`folder-edit-${folder.id}`}
-                  >
-                    <Pencil size={14} />
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    onClick={() => remove(folder)}
-                    className="text-red-600 hover:text-red-700 hover:bg-red-50"
-                    data-testid={`folder-delete-${folder.id}`}
-                  >
-                    <Trash2 size={14} />
-                  </Button>
+                  {isAdmin && (
+                    <>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => openEdit(folder)}
+                        data-testid={`folder-edit-${folder.id}`}
+                      >
+                        <Pencil size={14} />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => remove(folder)}
+                        className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                        data-testid={`folder-delete-${folder.id}`}
+                      >
+                        <Trash2 size={14} />
+                      </Button>
+                    </>
+                  )}
                 </div>
               </div>
             );

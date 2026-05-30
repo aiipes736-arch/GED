@@ -611,7 +611,11 @@ async def get_settings():
 @api.post("/settings/logo")
 async def update_logo(file: UploadFile = File(...), user: dict = Depends(current_user_dep)):
     require_admin(user)
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Le fichier doit être une image")
     data = await file.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="L'image doit faire moins de 5 Mo")
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png"
     path = f"{os.environ.get('APP_NAME', 'mhcged')}/settings/logo-{uuid.uuid4()}.{ext}"
     content_type = file.content_type or "image/png"
@@ -632,7 +636,11 @@ async def update_logo(file: UploadFile = File(...), user: dict = Depends(current
 @api.post("/settings/hero")
 async def update_hero(file: UploadFile = File(...), user: dict = Depends(current_user_dep)):
     require_admin(user)
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Le fichier doit être une image")
     data = await file.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="L'image doit faire moins de 5 Mo")
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png"
     path = f"{os.environ.get('APP_NAME', 'mhcged')}/settings/hero-{uuid.uuid4()}.{ext}"
     content_type = file.content_type or "image/png"
