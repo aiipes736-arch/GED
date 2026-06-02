@@ -7,3 +7,11 @@ pyjwt
 pydantic
 email-validator
 python-dotenv
+fastapi
+uvicorn
+motor
+python-dotenv
+dnspython
+bcrypt
+pyjwt
+requests
