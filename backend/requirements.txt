@@ -10,3 +10,4 @@ python-dotenv
 dnspython
 requests
 reportlab
+python-multipart
