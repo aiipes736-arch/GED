@@ -1,1344 +1,1386 @@
-"""MHCGED - Gestion Electronique des Documents (GED).
-
-Backend principal: FastAPI + MongoDB + Emergent Object Storage.
-"""
-from dotenv import load_dotenv
-from pathlib import Path
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
-
-import os
-import uuid
-import logging
-from datetime import datetime, timezone, timedelta
-from typing import List, Optional
-
-from bson import ObjectId
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, UploadFile, File, Form, Query
-from fastapi.responses import StreamingResponse
-import io
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, EmailStr, Field
-from starlette.middleware.cors import CORSMiddleware
-
-from auth import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    create_refresh_token,
-    set_auth_cookies,
-    clear_auth_cookies,
-    get_current_user,
-    require_admin,
-)
-import storage
-import reports as reports_mod
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-# MongoDB
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
-
-app = FastAPI(title="MHCGED API")
-api = APIRouter(prefix="/api")
-
-# Constants
-ARCHIVE_AFTER_YEARS = 5
-
-
-# ===================== Models =====================
-class LoginIn(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class UserOut(BaseModel):
-    id: str
-    email: EmailStr
-    name: str
-    role: str
-    is_active: bool
-    created_at: str
-
-
-class UserCreate(BaseModel):
-    email: EmailStr
-    password: str
-    name: str
-    role: str = "agent"
-
-
-class UserUpdate(BaseModel):
-    name: Optional[str] = None
-    role: Optional[str] = None
-    password: Optional[str] = None
-    is_active: Optional[bool] = None
-
-
-class FolderCreate(BaseModel):
-    name: str
-    parent_id: Optional[str] = None
-    description: Optional[str] = None
-
-
-class FolderUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    parent_id: Optional[str] = None
-
-
-class FolderOut(BaseModel):
-    id: str
-    name: str
-    parent_id: Optional[str] = None
-    description: Optional[str] = None
-    created_by: str
-    created_by_name: Optional[str] = None
-    created_at: str
-
-
-class DocumentUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
-    tags: Optional[List[str]] = None
-    folder_id: Optional[str] = None
-
-
-class DocumentOut(BaseModel):
-    id: str
-    title: str
-    description: Optional[str]
-    original_filename: str
-    content_type: str
-    size: int
-    folder_id: Optional[str]
-    folder_name: Optional[str] = None
-    tags: List[str] = []
-    uploaded_by: str
-    uploaded_by_name: Optional[str] = None
-    is_archived: bool
-    archived_at: Optional[str] = None
-    created_at: str
-
-
-class ShareIn(BaseModel):
-    user_ids: List[str]
-
-
-class PasswordResetIn(BaseModel):
-    new_password: str
-
-
-class MessageCreate(BaseModel):
-    to_user_id: str
-    content: str
-    attachment_doc_id: Optional[str] = None
-
-
-class MessageBroadcast(BaseModel):
-    to_user_ids: List[str]
-    content: str
-    attachment_doc_id: Optional[str] = None
-
-
-class CommentCreate(BaseModel):
-    content: str
-
-
-class AnnouncementCreate(BaseModel):
-    title: str
-    content: str
-    expires_at: Optional[str] = None  # ISO date string
-
-
-# ===================== Helpers =====================
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def user_public(u: dict) -> dict:
-    return {
-        "id": str(u.get("_id", u.get("id"))),
-        "email": u["email"],
-        "name": u.get("name", ""),
-        "role": u.get("role", "agent"),
-        "is_active": u.get("is_active", True),
-        "created_at": u.get("created_at", now_iso()),
-    }
-
-
-async def log_activity(user_id: str, user_name: str, action: str, details: str = "", target_type: str = "", target_id: str = ""):
-    await db.activity_logs.insert_one({
-        "id": str(uuid.uuid4()),
-        "user_id": user_id,
-        "user_name": user_name,
-        "action": action,
-        "details": details,
-        "target_type": target_type,
-        "target_id": target_id,
-        "timestamp": now_iso(),
-    })
-
-
-async def create_notification(user_id: str, title: str, message: str, link: str = "", actor_name: str = ""):
-    """Create an in-app notification for a user."""
-    if not user_id:
-        return
-    await db.notifications.insert_one({
-        "id": str(uuid.uuid4()),
-        "user_id": user_id,
-        "title": title,
-        "message": message,
-        "link": link,
-        "actor_name": actor_name,
-        "is_read": False,
-        "created_at": now_iso(),
-    })
-
-
-async def current_user_dep(request: Request) -> dict:
-    return await get_current_user(request, db)
-
-
-# ===================== Auth =====================
-@api.post("/auth/login")
-async def login(payload: LoginIn, response: Response):
-    email = payload.email.lower().strip()
-    user = await db.users.find_one({"email": email})
-    if not user or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Identifiants invalides")
-    if not user.get("is_active", True):
-        raise HTTPException(status_code=403, detail="Compte désactivé")
-    user_id = str(user["_id"])
-    access = create_access_token(user_id, user["email"], user.get("role", "agent"))
-    refresh = create_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
-    await log_activity(user_id, user.get("name", email), "login", "Connexion réussie")
-    return user_public(user)
-
-
-@api.post("/auth/logout")
-async def logout(response: Response, user: dict = Depends(current_user_dep)):
-    clear_auth_cookies(response)
-    await log_activity(user["id"], user.get("name", ""), "logout", "Déconnexion")
-    return {"message": "Déconnecté"}
-
-
-@api.get("/auth/me")
-async def me(user: dict = Depends(current_user_dep)):
-    return user
-
-
-# ===================== Users (Admin) =====================
-@api.get("/users", response_model=List[UserOut])
-async def list_users(user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    cursor = db.users.find({}).sort("created_at", -1)
-    out = []
-    async for u in cursor:
-        out.append(user_public(u))
-    return out
-
-
-@api.post("/users", response_model=UserOut)
-async def create_user(body: UserCreate, user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    email = body.email.lower().strip()
-    if await db.users.find_one({"email": email}):
-        raise HTTPException(status_code=400, detail="Email déjà utilisé")
-    if body.role not in ("admin", "agent"):
-        raise HTTPException(status_code=400, detail="Rôle invalide")
-    doc = {
-        "email": email,
-        "password_hash": hash_password(body.password),
-        "name": body.name,
-        "role": body.role,
-        "is_active": True,
-        "created_at": now_iso(),
-    }
-    res = await db.users.insert_one(doc)
-    doc["_id"] = res.inserted_id
-    await log_activity(user["id"], user["name"], "user_created", f"Agent créé: {email}", "user", str(res.inserted_id))
-    return user_public(doc)
-
-
-@api.put("/users/{user_id}", response_model=UserOut)
-async def update_user(user_id: str, body: UserUpdate, user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    try:
-        oid = ObjectId(user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID invalide")
-    existing = await db.users.find_one({"_id": oid})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Agent introuvable")
-    updates = {}
-    if body.name is not None:
-        updates["name"] = body.name
-    if body.role is not None:
-        if body.role not in ("admin", "agent"):
-            raise HTTPException(status_code=400, detail="Rôle invalide")
-        updates["role"] = body.role
-    if body.password:
-        updates["password_hash"] = hash_password(body.password)
-    if body.is_active is not None:
-        updates["is_active"] = body.is_active
-    if updates:
-        await db.users.update_one({"_id": oid}, {"$set": updates})
-    u = await db.users.find_one({"_id": oid})
-    await log_activity(user["id"], user["name"], "user_updated", f"Agent modifié: {u['email']}", "user", user_id)
-    return user_public(u)
-
-
-@api.delete("/users/{user_id}")
-async def delete_user(user_id: str, user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    if user_id == user["id"]:
-        raise HTTPException(status_code=400, detail="Vous ne pouvez pas vous supprimer")
-    try:
-        oid = ObjectId(user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID invalide")
-    u = await db.users.find_one({"_id": oid})
-    if not u:
-        raise HTTPException(status_code=404, detail="Agent introuvable")
-    await db.users.delete_one({"_id": oid})
-    await log_activity(user["id"], user["name"], "user_deleted", f"Agent supprimé: {u['email']}", "user", user_id)
-    return {"message": "Agent supprimé"}
-
-
-# ===================== Folders =====================
-@api.get("/folders", response_model=List[FolderOut])
-async def list_folders(user: dict = Depends(current_user_dep)):
-    # Agents see only their own folders; admin sees everything
-    q = {} if user.get("role") == "admin" else {"created_by": user["id"]}
-    cursor = db.folders.find(q, {"_id": 0}).sort("created_at", -1)
-    return await cursor.to_list(length=1000)
-
-
-@api.post("/folders", response_model=FolderOut)
-async def create_folder(body: FolderCreate, user: dict = Depends(current_user_dep)):
-    if body.parent_id:
-        parent = await db.folders.find_one({"id": body.parent_id})
-        if not parent:
-            raise HTTPException(status_code=400, detail="Dossier parent invalide")
-    doc = {
-        "id": str(uuid.uuid4()),
-        "name": body.name,
-        "parent_id": body.parent_id,
-        "description": body.description,
-        "created_by": user["id"],
-        "created_by_name": user.get("name", ""),
-        "created_at": now_iso(),
-    }
-    await db.folders.insert_one(doc)
-    await log_activity(user["id"], user["name"], "folder_created", f"Dossier créé: {body.name}", "folder", doc["id"])
-    doc.pop("_id", None)
-    return doc
-
-
-@api.put("/folders/{folder_id}", response_model=FolderOut)
-async def update_folder(folder_id: str, body: FolderUpdate, user: dict = Depends(current_user_dep)):
-    folder = await db.folders.find_one({"id": folder_id})
-    if not folder:
-        raise HTTPException(status_code=404, detail="Dossier introuvable")
-    if not _can_modify_folder(folder, user):
-        raise HTTPException(status_code=403, detail="Seul l'administrateur peut modifier un dossier")
-    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
-    if updates:
-        await db.folders.update_one({"id": folder_id}, {"$set": updates})
-    folder = await db.folders.find_one({"id": folder_id}, {"_id": 0})
-    await log_activity(user["id"], user["name"], "folder_updated", f"Dossier modifié: {folder['name']}", "folder", folder_id)
-    return folder
-
-
-@api.delete("/folders/{folder_id}")
-async def delete_folder(folder_id: str, user: dict = Depends(current_user_dep)):
-    folder = await db.folders.find_one({"id": folder_id})
-    if not folder:
-        raise HTTPException(status_code=404, detail="Dossier introuvable")
-    if not _can_modify_folder(folder, user):
-        raise HTTPException(status_code=403, detail="Seul l'administrateur peut supprimer un dossier")
-    # Detach documents from the folder rather than deleting them
-    await db.documents.update_many({"folder_id": folder_id}, {"$set": {"folder_id": None}})
-    await db.folders.delete_one({"id": folder_id})
-    await log_activity(user["id"], user["name"], "folder_deleted", f"Dossier supprimé: {folder['name']}", "folder", folder_id)
-    return {"message": "Dossier supprimé"}
-
-
-# ===================== Documents =====================
-async def _enrich_doc(d: dict) -> dict:
-    d.pop("_id", None)
-    d.pop("storage_path", None)
-    if d.get("folder_id"):
-        folder = await db.folders.find_one({"id": d["folder_id"]}, {"_id": 0, "name": 1})
-        d["folder_name"] = folder["name"] if folder else None
-    else:
-        d["folder_name"] = None
-    return d
-
-
-def _has_access(doc: dict, user: dict) -> bool:
-    if user.get("role") == "admin":
-        return True
-    if doc.get("uploaded_by") == user["id"]:
-        return True
-    if user["id"] in doc.get("shared_with", []):
-        return True
-    return False
-
-
-def _can_modify_doc(doc: dict, user: dict) -> bool:
-    """Only admins can modify/delete/share/archive documents."""
-    return user.get("role") == "admin"
-
-
-def _can_modify_folder(folder: dict, user: dict) -> bool:
-    """Only admins can modify/delete folders."""
-    return user.get("role") == "admin"
-
-
-@api.post("/documents")
-async def upload_document(
-    file: UploadFile = File(...),
-    title: str = Form(...),
-    description: str = Form(""),
-    folder_id: Optional[str] = Form(None),
-    tags: str = Form(""),  # comma-separated
-    user: dict = Depends(current_user_dep),
-):
-    data = await file.read()
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "bin"
-    storage_path = f"{os.environ.get('APP_NAME', 'mhcged')}/documents/{user['id']}/{uuid.uuid4()}.{ext}"
-    content_type = file.content_type or "application/octet-stream"
-    try:
-        result = storage.put_object(storage_path, data, content_type)
-    except Exception as e:
-        logger.exception("Upload storage error")
-        raise HTTPException(status_code=500, detail=f"Erreur stockage: {e}")
-
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-    doc = {
-        "id": str(uuid.uuid4()),
-        "title": title,
-        "description": description,
-        "original_filename": file.filename,
-        "content_type": content_type,
-        "size": result.get("size", len(data)),
-        "storage_path": result["path"],
-        "folder_id": folder_id or None,
-        "tags": tag_list,
-        "uploaded_by": user["id"],
-        "uploaded_by_name": user.get("name", ""),
-        "shared_with": [],
-        "is_archived": False,
-        "archived_at": None,
-        "is_deleted": False,
-        "created_at": now_iso(),
-    }
-    await db.documents.insert_one(doc)
-    await log_activity(user["id"], user["name"], "document_uploaded", f"Document téléversé: {title}", "document", doc["id"])
-    return await _enrich_doc(dict(doc))
-
-
-@api.get("/documents")
-async def list_documents(
-    archived: Optional[bool] = Query(None),
-    folder_id: Optional[str] = Query(None),
-    search: Optional[str] = Query(None),
-    tag: Optional[str] = Query(None),
-    user: dict = Depends(current_user_dep),
-):
-    q: dict = {"is_deleted": False}
-    if archived is not None:
-        q["is_archived"] = archived
-    if folder_id:
-        q["folder_id"] = folder_id
-    if tag:
-        q["tags"] = tag
-    if search:
-        q["$or"] = [
-            {"title": {"$regex": search, "$options": "i"}},
-            {"description": {"$regex": search, "$options": "i"}},
-            {"original_filename": {"$regex": search, "$options": "i"}},
-        ]
-    # Role-based filter: agents see only their own + shared
-    if user.get("role") != "admin":
-        q["$and"] = q.get("$and", []) + [{"$or": [
-            {"uploaded_by": user["id"]},
-            {"shared_with": user["id"]},
-        ]}]
-    cursor = db.documents.find(q).sort("created_at", -1)
-    out = []
-    async for d in cursor:
-        out.append(await _enrich_doc(d))
-    return out
-
-
-@api.get("/documents/{doc_id}")
-async def get_document(doc_id: str, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _has_access(d, user):
-        raise HTTPException(status_code=403, detail="Accès refusé")
-    return await _enrich_doc(d)
-
-
-@api.get("/documents/{doc_id}/download")
-async def download_document(doc_id: str, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _has_access(d, user):
-        raise HTTPException(status_code=403, detail="Accès refusé")
-    data: bytes = b""
-    ct: str = "application/octet-stream"
-    try:
-        data, ct = storage.get_object(d["storage_path"])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur téléchargement: {e}")
-    await log_activity(user["id"], user["name"], "document_downloaded", f"Téléchargement: {d['title']}", "document", doc_id)
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type=d.get("content_type") or ct,
-        headers={"Content-Disposition": f'attachment; filename="{d["original_filename"]}"'},
-    )
-
-
-@api.put("/documents/{doc_id}")
-async def update_document(doc_id: str, body: DocumentUpdate, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _can_modify_doc(d, user):
-        raise HTTPException(status_code=403, detail="Seul l'administrateur peut modifier un document")
-    updates = {k: v for k, v in body.model_dump(exclude_none=True).items()}
-    if updates:
-        await db.documents.update_one({"id": doc_id}, {"$set": updates})
-    d = await db.documents.find_one({"id": doc_id})
-    await log_activity(user["id"], user["name"], "document_updated", f"Document modifié: {d['title']}", "document", doc_id)
-    return await _enrich_doc(d)
-
-
-@api.delete("/documents/{doc_id}")
-async def delete_document(doc_id: str, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _can_modify_doc(d, user):
-        raise HTTPException(status_code=403, detail="Seul l'administrateur peut supprimer un document")
-    await db.documents.update_one({"id": doc_id}, {"$set": {"is_deleted": True, "deleted_at": now_iso()}})
-    await log_activity(user["id"], user["name"], "document_deleted", f"Document supprimé: {d['title']}", "document", doc_id)
-    return {"message": "Document supprimé"}
-
-
-@api.post("/documents/{doc_id}/archive")
-async def archive_document(doc_id: str, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _can_modify_doc(d, user):
-        raise HTTPException(status_code=403, detail="Seul l'administrateur peut archiver un document")
-    await db.documents.update_one(
-        {"id": doc_id},
-        {"$set": {"is_archived": True, "archived_at": now_iso()}},
-    )
-    await log_activity(user["id"], user["name"], "document_archived", f"Document archivé: {d['title']}", "document", doc_id)
-    return {"message": "Document archivé"}
-
-
-@api.post("/documents/{doc_id}/unarchive")
-async def unarchive_document(doc_id: str, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _can_modify_doc(d, user):
-        raise HTTPException(status_code=403, detail="Seul l'administrateur peut désarchiver un document")
-    await db.documents.update_one(
-        {"id": doc_id},
-        {"$set": {"is_archived": False, "archived_at": None}},
-    )
-    await log_activity(user["id"], user["name"], "document_unarchived", f"Document désarchivé: {d['title']}", "document", doc_id)
-    return {"message": "Document désarchivé"}
-
-
-@api.post("/documents/{doc_id}/share")
-async def share_document(doc_id: str, body: ShareIn, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _can_modify_doc(d, user):
-        raise HTTPException(status_code=403, detail="Seul l'administrateur peut partager un document")
-    prev = set(d.get("shared_with", []))
-    new_ids = set(body.user_ids)
-    added = new_ids - prev
-    await db.documents.update_many({"id": doc_id}, {"$set": {"shared_with": body.user_ids}})
-    # Notify newly added users
-    for uid in added:
-        await create_notification(
-            user_id=uid,
-            title="Document partagé avec vous",
-            message=f"{user.get('name', 'Un agent')} vous a partagé « {d['title']} »",
-            link="/inbox",
-            actor_name=user.get("name", ""),
-        )
-    await log_activity(user["id"], user["name"], "document_shared", f"Document partagé: {d['title']}", "document", doc_id)
-    return {"message": "Document partagé", "shared_with": body.user_ids}
-
-
-    await log_activity(user["id"], user["name"], "document_shared", f"Document partagé: {d['title']}", "document", doc_id)
-    return {"message": "Document partagé", "shared_with": body.user_ids}
-
-
-# ===================== Settings (logo / hero image) =====================
-DEFAULT_LOGO_URL = "https://customer-assets.emergentagent.com/job_ada3efd6-4e4c-4295-902b-4abf286154c2/artifacts/dmk2iip2_Photo%201.jpeg"
-DEFAULT_HERO_URL = "https://customer-assets.emergentagent.com/job_ada3efd6-4e4c-4295-902b-4abf286154c2/artifacts/15pprz55_Photo%202.jpeg"
-
-
-async def _get_settings_doc() -> dict:
-    doc = await db.settings.find_one({"_id": "app"})
-    if not doc:
-        return {"logo_url": DEFAULT_LOGO_URL, "hero_url": DEFAULT_HERO_URL}
-    return {
-        "logo_url": doc.get("logo_url") or DEFAULT_LOGO_URL,
-        "hero_url": doc.get("hero_url") or DEFAULT_HERO_URL,
-    }
-
-
-@api.get("/settings")
-async def get_settings():
-    """Public endpoint so the login screen can fetch the logo + hero."""
-    return await _get_settings_doc()
-
-
-@api.post("/settings/logo")
-async def update_logo(file: UploadFile = File(...), user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="Le fichier doit être une image")
-    data = await file.read()
-    if len(data) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="L'image doit faire moins de 5 Mo")
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png"
-    path = f"{os.environ.get('APP_NAME', 'mhcged')}/settings/logo-{uuid.uuid4()}.{ext}"
-    content_type = file.content_type or "image/png"
-    try:
-        result = storage.put_object(path, data, content_type)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur upload: {e}")
-    public_url = f"/api/settings/file/{result['path']}"
-    await db.settings.update_one(
-        {"_id": "app"},
-        {"$set": {"logo_url": public_url, "logo_path": result["path"], "updated_at": now_iso()}},
-        upsert=True,
-    )
-    await log_activity(user["id"], user["name"], "logo_updated", "Logo mis à jour", "settings", "logo")
-    return await _get_settings_doc()
-
-
-@api.post("/settings/hero")
-async def update_hero(file: UploadFile = File(...), user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    if not (file.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="Le fichier doit être une image")
-    data = await file.read()
-    if len(data) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="L'image doit faire moins de 5 Mo")
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png"
-    path = f"{os.environ.get('APP_NAME', 'mhcged')}/settings/hero-{uuid.uuid4()}.{ext}"
-    content_type = file.content_type or "image/png"
-    try:
-        result = storage.put_object(path, data, content_type)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur upload: {e}")
-    public_url = f"/api/settings/file/{result['path']}"
-    await db.settings.update_one(
-        {"_id": "app"},
-        {"$set": {"hero_url": public_url, "hero_path": result["path"], "updated_at": now_iso()}},
-        upsert=True,
-    )
-    await log_activity(user["id"], user["name"], "hero_updated", "Image d'accueil mise à jour", "settings", "hero")
-    return await _get_settings_doc()
-
-
-@api.get("/settings/file/{path:path}")
-async def settings_file(path: str):
-    """Serve the uploaded logo/hero images publicly (no auth required for login screen)."""
-    try:
-        data, ct = storage.get_object(path)
-    except Exception:
-        raise HTTPException(status_code=404, detail="Image introuvable")
-    return Response(content=data, media_type=ct)
-
-
-# ===================== Tags =====================
-@api.get("/tags")
-async def list_tags(user: dict = Depends(current_user_dep)):
-    tags = await db.documents.distinct("tags", {"is_deleted": False})
-    return sorted([t for t in tags if t])
-
-
-# ===================== Dashboard =====================
-@api.get("/dashboard/stats")
-async def dashboard_stats(user: dict = Depends(current_user_dep)):
-    base = {"is_deleted": False}
-    if user.get("role") != "admin":
-        base["$or"] = [{"uploaded_by": user["id"]}, {"shared_with": user["id"]}]
-    total_docs = await db.documents.count_documents({**base, "is_archived": False})
-    total_archived = await db.documents.count_documents({**base, "is_archived": True})
-    total_folders = await db.folders.count_documents({})
-    total_agents = await db.users.count_documents({}) if user.get("role") == "admin" else 0
-
-    # Recent documents
-    recents_cursor = db.documents.find(base).sort("created_at", -1).limit(5)
-    recents = []
-    async for d in recents_cursor:
-        recents.append(await _enrich_doc(d))
-
-    # Storage size
-    pipeline = [
-        {"$match": base},
-        {"$group": {"_id": None, "total": {"$sum": "$size"}}},
-    ]
-    size_doc = await db.documents.aggregate(pipeline).to_list(1)
-    total_size = size_doc[0]["total"] if size_doc else 0
-
-    return {
-        "total_documents": total_docs,
-        "total_archived": total_archived,
-        "total_folders": total_folders,
-        "total_agents": total_agents,
-        "total_size": total_size,
-        "recent_documents": recents,
-    }
-
-
-# ===================== Activity =====================
-@api.get("/activity")
-async def list_activity(limit: int = 100, user: dict = Depends(current_user_dep)):
-    q = {} if user.get("role") == "admin" else {"user_id": user["id"]}
-    cursor = db.activity_logs.find(q, {"_id": 0}).sort("timestamp", -1).limit(limit)
-    return await cursor.to_list(length=limit)
-
-
-# ===================== Notifications =====================
-@api.get("/notifications")
-async def list_notifications(limit: int = 30, user: dict = Depends(current_user_dep)):
-    cursor = db.notifications.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).limit(limit)
-    items = await cursor.to_list(length=limit)
-    unread = await db.notifications.count_documents({"user_id": user["id"], "is_read": False})
-    return {"items": items, "unread_count": unread}
-
-
-@api.post("/notifications/{notif_id}/read")
-async def mark_notification_read(notif_id: str, user: dict = Depends(current_user_dep)):
-    await db.notifications.update_one(
-        {"id": notif_id, "user_id": user["id"]},
-        {"$set": {"is_read": True}},
-    )
-    return {"message": "ok"}
-
-
-@api.post("/notifications/read-all")
-async def mark_all_notifications_read(user: dict = Depends(current_user_dep)):
-    await db.notifications.update_many(
-        {"user_id": user["id"], "is_read": False},
-        {"$set": {"is_read": True}},
-    )
-    return {"message": "ok"}
-
-
-# ===================== Admin password reset =====================
-@api.post("/users/{user_id}/reset-password")
-async def admin_reset_password(user_id: str, body: PasswordResetIn, user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    try:
-        oid = ObjectId(user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID invalide")
-    target = await db.users.find_one({"_id": oid})
-    if not target:
-        raise HTTPException(status_code=404, detail="Agent introuvable")
-    if len(body.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Mot de passe trop court (min 6 caractères)")
-    await db.users.update_one({"_id": oid}, {"$set": {"password_hash": hash_password(body.new_password)}})
-    await log_activity(user["id"], user["name"], "password_reset", f"Mot de passe réinitialisé pour: {target['email']}", "user", user_id)
-    await create_notification(
-        user_id=str(oid),
-        title="Mot de passe réinitialisé",
-        message=f"Votre mot de passe a été réinitialisé par {user.get('name', 'un administrateur')}.",
-        link="/profile",
-        actor_name=user.get("name", ""),
-    )
-    return {"message": "Mot de passe réinitialisé"}
-
-
-# ===================== Reports =====================
-async def _build_report_data(year: int, month: int, agent_id: Optional[str]):
-    """Compute top documents and top agents for the given month + optional agent filter."""
-    if month < 1 or month > 12:
-        raise HTTPException(status_code=400, detail="Mois invalide")
-    start = datetime(year, month, 1, tzinfo=timezone.utc)
-    if month == 12:
-        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-    else:
-        end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
-    start_iso = start.isoformat()
-    end_iso = end.isoformat()
-
-    # Activity logs filter for the month
-    activity_match = {"timestamp": {"$gte": start_iso, "$lt": end_iso}}
-    if agent_id:
-        activity_match["user_id"] = agent_id
-
-    # Top documents (most downloaded)
-    download_match = {**activity_match, "action": "document_downloaded", "target_id": {"$ne": ""}}
-    top_docs_raw = await db.activity_logs.aggregate([
-        {"$match": download_match},
-        {"$group": {"_id": "$target_id", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 5},
-    ]).to_list(length=5)
-
-    top_docs = []
-    for entry in top_docs_raw:
-        d = await db.documents.find_one({"id": entry["_id"]}, {"_id": 0, "title": 1})
-        title = d["title"] if d else f"Document {entry['_id'][:8]}"
-        top_docs.append({"id": entry["_id"], "title": title, "count": entry["count"]})
-
-    # Top agents (most actions) - only meaningful when looking at all agents
-    top_agents_raw = await db.activity_logs.aggregate([
-        {"$match": activity_match},
-        {"$group": {"_id": "$user_id", "name": {"$first": "$user_name"}, "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 5},
-    ]).to_list(length=5)
-    top_agents = [
-        {"id": a["_id"], "name": a.get("name") or "—", "count": a["count"]}
-        for a in top_agents_raw
-    ]
-
-    # Scope label for header
-    if agent_id:
-        agent_doc = None
-        try:
-            agent_doc = await db.users.find_one({"_id": ObjectId(agent_id)}, {"_id": 0, "name": 1, "email": 1})
-        except Exception:
-            agent_doc = None
-        scope_label = f"Agent : {agent_doc['name'] if agent_doc else agent_id}"
-    else:
-        scope_label = "Tous les agents"
-
-    return {
-        "top_docs": top_docs,
-        "top_agents": top_agents,
-        "scope_label": scope_label,
-    }
-
-
-@api.get("/reports/monthly")
-async def report_monthly_preview(
-    year: int = Query(..., ge=2000, le=3000),
-    month: int = Query(..., ge=1, le=12),
-    agent_id: Optional[str] = Query(None),
-    user: dict = Depends(current_user_dep),
-):
-    """Return the report data as JSON (preview before PDF download)."""
-    require_admin(user)
-    data = await _build_report_data(year, month, agent_id)
-    return data
-
-
-@api.get("/reports/monthly/pdf")
-async def report_monthly_pdf(
-    year: int = Query(..., ge=2000, le=3000),
-    month: int = Query(..., ge=1, le=12),
-    agent_id: Optional[str] = Query(None),
-    user: dict = Depends(current_user_dep),
-):
-    """Generate and stream the monthly PDF report."""
-    require_admin(user)
-    data = await _build_report_data(year, month, agent_id)
-    pdf_bytes = reports_mod.build_monthly_report_pdf(
-        year=year,
-        month=month,
-        scope_label=data["scope_label"],
-        top_docs=data["top_docs"],
-        top_agents=data["top_agents"],
-        signed_by_name=user.get("name") or "Administrateur",
-        signed_by_role="Administrateur · MHCGED",
-    )
-    await log_activity(
-        user["id"], user.get("name", ""),
-        "report_generated",
-        f"Rapport mensuel généré: {month:02d}/{year}" + (f" (agent {agent_id})" if agent_id else ""),
-        "report",
-        f"{year}-{month:02d}",
-    )
-    filename = f"rapport-mhcged-{year}-{month:02d}.pdf"
-    return StreamingResponse(
-        io.BytesIO(pdf_bytes),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
-# ===================== Messages =====================
-async def _user_lite(uid: str) -> dict:
-    try:
-        u = await db.users.find_one({"_id": ObjectId(uid)}, {"_id": 0, "name": 1, "email": 1, "role": 1})
-    except Exception:
-        u = None
-    return {
-        "id": uid,
-        "name": (u or {}).get("name", "Utilisateur"),
-        "email": (u or {}).get("email", ""),
-        "role": (u or {}).get("role", "agent"),
-    }
-
-
-@api.post("/messages")
-async def send_message(body: MessageCreate, user: dict = Depends(current_user_dep)):
-    if not body.content.strip() and not body.attachment_doc_id:
-        raise HTTPException(status_code=400, detail="Message vide")
-    try:
-        ObjectId(body.to_user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Destinataire invalide")
-    target = await db.users.find_one({"_id": ObjectId(body.to_user_id)})
-    if not target:
-        raise HTTPException(status_code=404, detail="Destinataire introuvable")
-    if body.to_user_id == user["id"]:
-        raise HTTPException(status_code=400, detail="Vous ne pouvez pas vous envoyer un message")
-
-    attachment = None
-    if body.attachment_doc_id:
-        d = await db.documents.find_one(
-            {"id": body.attachment_doc_id, "is_deleted": False},
-            {"_id": 0, "id": 1, "title": 1, "original_filename": 1, "shared_with": 1, "uploaded_by": 1},
-        )
-        if d:
-            # Security: sender must own the doc, admin, or already have access (shared_with)
-            sender_has_access = (
-                user.get("role") == "admin"
-                or d.get("uploaded_by") == user["id"]
-                or user["id"] in (d.get("shared_with") or [])
-            )
-            if not sender_has_access:
-                raise HTTPException(status_code=403, detail="Vous n'avez pas accès à ce document")
-            attachment = {"id": d["id"], "title": d["title"], "original_filename": d["original_filename"]}
-            # Auto-share: grant the recipient access to the attached document
-            shared = set(d.get("shared_with", []) or [])
-            if body.to_user_id not in shared and d.get("uploaded_by") != body.to_user_id:
-                shared.add(body.to_user_id)
-                await db.documents.update_one(
-                    {"id": d["id"]},
-                    {"$set": {"shared_with": list(shared)}},
-                )
-    msg = {
-        "id": str(uuid.uuid4()),
-        "from_user_id": user["id"],
-        "from_user_name": user.get("name", ""),
-        "to_user_id": body.to_user_id,
-        "to_user_name": target.get("name", ""),
-        "content": body.content,
-        "attachment": attachment,
-        "is_read": False,
-        "is_deleted": False,
-        "created_at": now_iso(),
-    }
-    await db.messages.insert_one(msg)
-    await create_notification(
-        user_id=body.to_user_id,
-        title="Nouveau message",
-        message=f"{user.get('name', 'Un agent')} vous a envoyé un message",
-        link="/messages",
-        actor_name=user.get("name", ""),
-    )
-    msg.pop("_id", None)
-    return msg
-
-
-@api.post("/messages/broadcast")
-async def broadcast_message(body: MessageBroadcast, user: dict = Depends(current_user_dep)):
-    """Send the same message to multiple recipients (creates one message per recipient)."""
-    if not body.content.strip() and not body.attachment_doc_id:
-        raise HTTPException(status_code=400, detail="Message vide")
-    if not body.to_user_ids:
-        raise HTTPException(status_code=400, detail="Au moins un destinataire requis")
-    # Filter out self and validate ObjectIds
-    valid_ids: List[str] = []
-    for uid in body.to_user_ids:
-        if uid == user["id"]:
-            continue
-        try:
-            ObjectId(uid)
-        except Exception:
-            continue
-        valid_ids.append(uid)
-    if not valid_ids:
-        raise HTTPException(status_code=400, detail="Aucun destinataire valide")
-
-    # Resolve doc + auto-share with all recipients
-    attachment = None
-    if body.attachment_doc_id:
-        d = await db.documents.find_one(
-            {"id": body.attachment_doc_id, "is_deleted": False},
-            {"_id": 0, "id": 1, "title": 1, "original_filename": 1, "shared_with": 1, "uploaded_by": 1},
-        )
-        if d:
-            sender_has_access = (
-                user.get("role") == "admin"
-                or d.get("uploaded_by") == user["id"]
-                or user["id"] in (d.get("shared_with") or [])
-            )
-            if not sender_has_access:
-                raise HTTPException(status_code=403, detail="Vous n'avez pas accès à ce document")
-            attachment = {"id": d["id"], "title": d["title"], "original_filename": d["original_filename"]}
-            shared = set(d.get("shared_with", []) or [])
-            new_shared = shared.union(uid for uid in valid_ids if uid != d.get("uploaded_by"))
-            if new_shared != shared:
-                await db.documents.update_one({"id": d["id"]}, {"$set": {"shared_with": list(new_shared)}})
-
-    # Fetch recipient names in one query
-    oids = [ObjectId(uid) for uid in valid_ids]
-    users_cursor = db.users.find({"_id": {"$in": oids}}, {"_id": 1, "name": 1})
-    name_by_id = {str(u["_id"]): u.get("name", "") async for u in users_cursor}
-
-    created = 0
-    for uid in valid_ids:
-        if uid not in name_by_id:
-            continue
-        msg = {
-            "id": str(uuid.uuid4()),
-            "from_user_id": user["id"],
-            "from_user_name": user.get("name", ""),
-            "to_user_id": uid,
-            "to_user_name": name_by_id[uid],
-            "content": body.content,
-            "attachment": attachment,
-            "is_read": False,
-            "is_deleted": False,
-            "created_at": now_iso(),
+<!DOCTYPE html>
+<html lang="fr" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GED - Ministère des Hydrocarbures - République du Congo</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            transition: background-color 0.3s ease, background-image 0.3s ease;
         }
-        await db.messages.insert_one(msg)
-        await create_notification(
-            user_id=uid,
-            title="Nouveau message",
-            message=f"{user.get('name', 'Un agent')} vous a envoyé un message",
-            link="/messages",
-            actor_name=user.get("name", ""),
-        )
-        created += 1
-    await log_activity(user["id"], user["name"], "message_broadcast", f"Message diffusé à {created} agent(s)", "message", "")
-    return {"sent": created}
+        /* Custom scrollbar style */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #F4F2EB;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #C4C2BB;
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #A4A29B;
+        }
+        /* Glass effect utilities */
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(0, 0, 0, 0.08);
+        }
+    </style>
+</head>
+<body class="h-full overflow-hidden bg-[#F4F2EB] text-[#1A1A1A]">
 
+    <div id="app-root" class="h-full w-full flex flex-col">
+        <!-- Loader / Splash UI (Hidden once app mounts) -->
+        <div id="splash-screen" class="fixed inset-0 z-50 bg-[#F4F2EB] flex flex-col items-center justify-center">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-emerald-800"></div>
+            <p class="mt-4 text-sm font-semibold text-emerald-900 tracking-wider">CHARGEMENT DE LA PLATEFORME SECURISEE...</p>
+        </div>
+    </div>
 
-@api.delete("/messages/{message_id}")
-async def delete_message(message_id: str, user: dict = Depends(current_user_dep)):
-    m = await db.messages.find_one({"id": message_id})
-    if not m:
-        raise HTTPException(status_code=404, detail="Message introuvable")
-    if user.get("role") != "admin" and m.get("from_user_id") != user["id"]:
-        raise HTTPException(status_code=403, detail="Vous ne pouvez supprimer que vos propres messages")
-    await db.messages.update_one({"id": message_id}, {"$set": {"is_deleted": True, "deleted_at": now_iso()}})
-    return {"message": "Message supprimé"}
-
-
-@api.get("/messages/conversations")
-async def list_conversations(search: Optional[str] = Query(None), user: dict = Depends(current_user_dep)):
-    """Return list of conversations with last message + unread count for current user."""
-    pipeline = [
-        {"$match": {
-            "$or": [{"from_user_id": user["id"]}, {"to_user_id": user["id"]}],
-            "is_deleted": {"$ne": True},
-        }},
-        {"$sort": {"created_at": -1}},
-        {
-            "$group": {
-                "_id": {
-                    "$cond": [
-                        {"$eq": ["$from_user_id", user["id"]]},
-                        "$to_user_id",
-                        "$from_user_id",
-                    ]
-                },
-                "last_message": {"$first": "$$ROOT"},
-                "unread_count": {
-                    "$sum": {
-                        "$cond": [
-                            {"$and": [
-                                {"$eq": ["$to_user_id", user["id"]]},
-                                {"$eq": ["$is_read", False]},
-                            ]},
-                            1,
-                            0,
-                        ]
-                    }
-                },
+    <script>
+        // Global Application State Store
+        const State = {
+            currentUser: null, // Initially null to display LoginScreen
+            mfaPassed: false,
+            activeTab: 'dashboard', // dashboard, documents, messages, history, parameters
+            customTitles: {
+                main: "Gestion Électronique des Documents",
+                ministre: "MINISTÈRE DES HYDROCARBURES",
+                pays: "RÉPUBLIQUE DU CONGO"
+            },
+            wallpaper: {
+                type: 'color', // 'color' or 'image'
+                value: '#F4F2EB' // Premium Off-White Default
+            },
+            logo: "https://placehold.co/150x150/104F34/FFFFFF?text=MHC+CONGO", // High-fidelity Fallback Logo
+            accounts: [
+                { id: 'admin', name: 'Administrateur Principal', email: 'admin@mhcged.cg', role: 'ADMIN', service: 'Sécurité globale' },
+                { id: 'dsic', name: 'Ing. Guy-Roger N\'Gassaki', email: 'g.ngassaki@mhcged.cg', role: 'DSIC', service: 'Direction Systèmes d\'Information' },
+                { id: 'direction', name: 'Directeur Général Cabinet', email: 'direction@mhcged.cg', role: 'DIRECTION', service: 'Cabinet Ministériel' }
+            ],
+            localServer: {
+                status: 'offline', // online, offline, syncing
+                port: '8080',
+                ip: '127.0.0.1',
+                logs: [
+                    '[SYSTÈME] Services prêts à démarrer.',
+                    '[DB] Liaison de données chiffrées SQLite locale initialisée.'
+                ],
+                syncProgress: 0
+            },
+            documents: [
+                { id: 1, name: "Rapport_Forage_Likouala_2026.pdf", size: "4.2 Mo", date: "05/06/2026", category: "Rapports d'Activité", creator: "DSIC", content: "REPUBLIQUE DU CONGO\nMINISTERE DES HYDROCARBURES\n\nRAPPORT TECHNIQUE - EXPLOITATION LIKOUALA\nDate : Juin 2026\n\n1. CONTEXTE DE FORAGE\nLes opérations de forage exploratoire sur le puits de Likouala Est se sont déroulées conformément aux normes géologiques nationales. Les relevés indiquent une colonne sédimentaire hautement favorable avec des réservoirs d'huile compacts.\n\n2. DONNÉES TECHNIQUES COMPLÉMENTAIRES\n- Débit moyen mesuré : 14,500 barils/jour\n- Densité de l'API : 32.4\n- Température moyenne de tête de puits : 87°C\n- Pression interne estimée : 410 bar\n\n3. CONCLUSIONS ET RECOMMANDATIONS\nIl est recommandé d'initier la phase II de production précoce dès approbation finale du cabinet directionnel du Ministère." },
+                { id: 2, name: "Decret_Cadre_Hydrocarbures.pdf", size: "1.8 Mo", date: "24/05/2026", category: "Décrets & Réglementations", creator: "Cabinet", content: "REPUBLIQUE DU CONGO\nUNION - TRAVAIL - PROGRES\n\nDECRET PORTANT REGLEMENTATION DES TITRES ET CONCESSIONS PETROLIERES\n\nArticle 1er : Tout titre minier d'hydrocarbures sur le territoire de la République du Congo, qu'il soit offshore ou onshore, est assujetti à la validation d'un plan d'impact socio-environnemental préalable validé par le Ministère en charge.\n\nArticle 2 : Les redevances d'extraction minière sont fixées proportionnellement aux volumes consolidés après arbitrage de l'autorité de régulation pétrolière nationale.\n\nFait à Brazzaville, le 24 Mai 2026." },
+                { id: 3, name: "Plan_Strategique_SNH_2026_2030.pdf", size: "12.5 Mo", date: "12/04/2026", category: "Plans Stratégiques", creator: "Direction", content: "MINISTERE DES HYDROCARBURES\nREPUBLIQUE DU CONGO\n\nPLAN STRATÉGIQUE NATIONAL HYDROCARBURES (2026-2030)\n\nAxes Stratégiques Majeurs :\n\n- AXE 1 : Modernisation complète de l'administration des hydrocarbures via la GED (Gestion Électronique des Documents) sécurisée en réseau fermé.\n- AXE 2 : Valorisation et intégration industrielle locale (Local Content) à hauteur de 45% minimum sur l'ensemble de la chaîne de valeur d'ici fin 2028.\n- AXE 3 : Diversification du mix énergétique national avec l'introduction progressive de centrales de co-génération au gaz naturel liquéfié." }
+            ],
+            messages: [
+                { sender: 'Ing. Guy-Roger N\'Gassaki', role: 'DSIC', text: 'La base de données locale du Ministère a été synchronisée. Prêt pour les imports de ce matin.', time: '09:12' },
+                { sender: 'Directeur Général Cabinet', role: 'DIRECTION', text: 'Bien reçu. Veuillez téléverser les fiches de synthèse d\'activité pétrolière trimestrielle.', time: '10:04' }
+            ],
+            systemLogs: [
+                { id: 1, action: "Connexion utilisateur sécurisée", user: "DSIC", date: "05/06/2026 19:12:30", ip: "192.168.1.12" },
+                { id: 2, action: "Consultation Rapport_Forage_Likouala.pdf", user: "DSIC", date: "05/06/2026 19:15:02", ip: "192.168.1.12" }
+            ],
+            pdfViewer: {
+                isOpen: false,
+                document: null,
+                zoom: 100
             }
-        },
-        {"$sort": {"last_message.created_at": -1}},
-    ]
-    raw = await db.messages.aggregate(pipeline).to_list(length=200)
-    out = []
-    for c in raw:
-        peer = await _user_lite(c["_id"])
-        last = c["last_message"]
-        last.pop("_id", None)
-        out.append({
-            "peer": peer,
-            "last_message": last,
-            "unread_count": c["unread_count"],
-        })
-    # Filter by search term (peer name or last message content, case-insensitive)
-    if search:
-        s = search.lower().strip()
-        out = [
-            c for c in out
-            if s in (c["peer"]["name"] or "").lower()
-            or s in (c["last_message"].get("content") or "").lower()
-        ]
-    return out
+        };
 
+        // Save and Load helper for simple state persistence
+        function saveStateToStorage() {
+            localStorage.setItem('mhc_ged_state', JSON.stringify({
+                customTitles: State.customTitles,
+                wallpaper: State.wallpaper,
+                logo: State.logo,
+                accounts: State.accounts,
+                documents: State.documents,
+                localServer: {
+                    port: State.localServer.port,
+                    ip: State.localServer.ip,
+                    status: State.localServer.status,
+                    logs: State.localServer.logs
+                }
+            }));
+        }
 
-@api.get("/messages/conversation/{peer_id}")
-async def get_conversation(peer_id: str, search: Optional[str] = Query(None), user: dict = Depends(current_user_dep)):
-    q: dict = {
-        "is_deleted": {"$ne": True},
-        "$or": [
-            {"from_user_id": user["id"], "to_user_id": peer_id},
-            {"from_user_id": peer_id, "to_user_id": user["id"]},
-        ],
-    }
-    if search:
-        q["content"] = {"$regex": search, "$options": "i"}
-    cursor = db.messages.find(q, {"_id": 0}).sort("created_at", 1)
-    msgs = await cursor.to_list(length=1000)
-    # Mark as read everything received
-    await db.messages.update_many(
-        {"to_user_id": user["id"], "from_user_id": peer_id, "is_read": False},
-        {"$set": {"is_read": True}},
-    )
-    peer = await _user_lite(peer_id)
-    return {"peer": peer, "messages": msgs}
+        function loadStateFromStorage() {
+            const data = localStorage.getItem('mhc_ged_state');
+            if (data) {
+                try {
+                    const parsed = JSON.parse(data);
+                    State.customTitles = parsed.customTitles || State.customTitles;
+                    State.wallpaper = parsed.wallpaper || State.wallpaper;
+                    State.logo = parsed.logo || State.logo;
+                    State.accounts = parsed.accounts || State.accounts;
+                    if (parsed.documents) State.documents = parsed.documents;
+                    if (parsed.localServer) {
+                        State.localServer.port = parsed.localServer.port || State.localServer.port;
+                        State.localServer.ip = parsed.localServer.ip || State.localServer.ip;
+                        State.localServer.status = parsed.localServer.status || State.localServer.status;
+                        State.localServer.logs = parsed.localServer.logs || State.localServer.logs;
+                    }
+                } catch(e) {
+                    console.error("Storage loading fallback initiated.", e);
+                }
+            }
+        }
 
+        loadStateFromStorage();
 
-@api.get("/messages/unread-count")
-async def messages_unread_count(user: dict = Depends(current_user_dep)):
-    n = await db.messages.count_documents({
-        "to_user_id": user["id"],
-        "is_read": False,
-        "is_deleted": {"$ne": True},
-    })
-    return {"unread_count": n}
+        // Main Render Function (re-renders active view based on state changes)
+        function renderApp() {
+            const root = document.getElementById('app-root');
+            if (!root) return;
 
+            // Apply global wallpaper layout
+            applyGlobalWallpaper();
 
-# ===================== Document comments =====================
-@api.get("/documents/{doc_id}/comments")
-async def list_comments(doc_id: str, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _has_access(d, user):
-        raise HTTPException(status_code=403, detail="Accès refusé")
-    cursor = db.comments.find({"doc_id": doc_id}, {"_id": 0}).sort("created_at", 1)
-    return await cursor.to_list(length=500)
+            if (!State.currentUser) {
+                // Show Login Screen
+                root.innerHTML = getLoginScreenHTML();
+                attachLoginScreenEvents();
+            } else if (!State.mfaPassed) {
+                // Show MFA verification Screen
+                root.innerHTML = getMfaScreenHTML();
+                attachMfaScreenEvents();
+            } else {
+                // Show Dashboard
+                root.innerHTML = `
+                    <div class="h-full flex flex-col md:flex-row overflow-hidden">
+                        <!-- Sidebar Area -->
+                        <div class="w-full md:w-80 flex-shrink-0 border-r border-gray-300 flex flex-col glass-panel" style="background-color: #F4F2EB;">
+                            ${getSidebarHTML()}
+                        </div>
+                        
+                        <!-- Main Content Workspace Area -->
+                        <div class="flex-1 flex flex-col overflow-hidden">
+                            ${getHeaderHTML()}
+                            <main class="flex-1 overflow-y-auto p-4 md:p-8">
+                                ${getMainContentHTML()}
+                            </main>
+                        </div>
+                    </div>
+                    ${getPdfViewerModalHTML()}
+                `;
+                attachDashboardEvents();
+                attachPdfViewerEvents();
+            }
 
+            // Hide loader screen
+            const splash = document.getElementById('splash-screen');
+            if (splash) {
+                splash.style.display = 'none';
+            }
+        }
 
-@api.post("/documents/{doc_id}/comments")
-async def add_comment(doc_id: str, body: CommentCreate, user: dict = Depends(current_user_dep)):
-    if not body.content.strip():
-        raise HTTPException(status_code=400, detail="Commentaire vide")
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d:
-        raise HTTPException(status_code=404, detail="Document introuvable")
-    if not _has_access(d, user):
-        raise HTTPException(status_code=403, detail="Accès refusé")
-    c = {
-        "id": str(uuid.uuid4()),
-        "doc_id": doc_id,
-        "user_id": user["id"],
-        "user_name": user.get("name", ""),
-        "content": body.content,
-        "created_at": now_iso(),
-    }
-    await db.comments.insert_one(c)
-    # Notify the document owner if it's not the commenter
-    if d.get("uploaded_by") and d["uploaded_by"] != user["id"]:
-        await create_notification(
-            user_id=d["uploaded_by"],
-            title="Nouveau commentaire",
-            message=f"{user.get('name', 'Un agent')} a commenté « {d['title']} »",
-            link="/documents",
-            actor_name=user.get("name", ""),
-        )
-    c.pop("_id", None)
-    return c
+        function applyGlobalWallpaper() {
+            const body = document.body;
+            if (State.wallpaper.type === 'color') {
+                body.style.backgroundImage = 'none';
+                body.style.backgroundColor = State.wallpaper.value;
+            } else {
+                body.style.backgroundImage = `url('${State.wallpaper.value}')`;
+                body.style.backgroundSize = 'cover';
+                body.style.backgroundPosition = 'center';
+                body.style.backgroundRepeat = 'no-repeat';
+            }
+        }
 
+        // Template HTML for Login Screen
+        function getLoginScreenHTML() {
+            return `
+                <div class="min-h-screen flex items-center justify-center p-4">
+                    <div class="max-w-md w-full glass-panel rounded-2xl p-8 shadow-2xl relative overflow-hidden border border-emerald-900/10">
+                        <div class="absolute top-0 inset-x-0 h-2 bg-emerald-800"></div>
+                        
+                        <!-- Country Name & Coat of Arms -->
+                        <div class="text-center mb-6">
+                            <div class="flex justify-center mb-3">
+                                <img src="${State.logo}" alt="Sceau" class="h-20 w-20 rounded-xl shadow-md border-2 border-emerald-800/10 object-cover" id="login-sceau-img">
+                            </div>
+                            <span class="text-xs font-bold tracking-widest text-emerald-800 uppercase block">${State.customTitles.pays}</span>
+                            <h2 class="text-md font-extrabold text-[#1A1A1A] tracking-tight uppercase mt-1 leading-tight">${State.customTitles.ministre}</h2>
+                            <p class="text-[11px] text-gray-500 font-medium mt-1">Plateforme GED Sécurisée National</p>
+                        </div>
 
-@api.delete("/comments/{comment_id}")
-async def delete_comment(comment_id: str, user: dict = Depends(current_user_dep)):
-    c = await db.comments.find_one({"id": comment_id})
-    if not c:
-        raise HTTPException(status_code=404, detail="Commentaire introuvable")
-    if user.get("role") != "admin" and c["user_id"] != user["id"]:
-        raise HTTPException(status_code=403, detail="Accès refusé")
-    await db.comments.delete_one({"id": comment_id})
-    return {"message": "Commentaire supprimé"}
+                        <!-- Main Screen Title -->
+                        <div class="border-t border-b border-gray-200 py-3 mb-6 text-center">
+                            <h1 class="text-xl font-bold text-[#1A1A1A] leading-snug">${State.customTitles.main}</h1>
+                        </div>
 
+                        <!-- Direct Profiles Access -->
+                        <div class="mb-6">
+                            <label class="block text-xs font-bold text-gray-700 uppercase mb-3 text-center">Sélectionner un Profil d'Accès</label>
+                            <div class="space-y-3">
+                                ${State.accounts.map(acc => `
+                                    <button onclick="selectProfileAndConnect('${acc.id}')" class="w-full text-left p-4 rounded-xl border border-gray-200 hover:border-emerald-600 bg-white/70 hover:bg-emerald-50/50 transition-all shadow-sm hover:shadow-md flex items-center justify-between group">
+                                        <div>
+                                            <div class="font-bold text-sm text-[#1A1A1A]">${acc.name}</div>
+                                            <div class="text-xs text-gray-500">${acc.email}</div>
+                                            <span class="inline-block mt-1.5 px-2 py-0.5 rounded text-[10px] font-bold tracking-wider ${acc.role === 'ADMIN' ? 'bg-red-100 text-red-800' : acc.role === 'DIRECTION' ? 'bg-indigo-100 text-indigo-800' : 'bg-emerald-100 text-emerald-800'}">${acc.role}</span>
+                                        </div>
+                                        <div class="h-8 w-8 rounded-full bg-emerald-100 group-hover:bg-emerald-800 flex items-center justify-center text-emerald-800 group-hover:text-white transition-colors">
+                                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M9 5l7 7-7 7" /></svg>
+                                        </div>
+                                    </button>
+                                `).join('')}
+                            </div>
+                        </div>
 
-# ===================== Inbox =====================
-@api.get("/inbox")
-async def list_inbox(user: dict = Depends(current_user_dep)):
-    """Documents shared WITH the current user (the inbox)."""
-    cursor = db.documents.find({
-        "is_deleted": False,
-        "shared_with": user["id"],
-    }).sort("created_at", -1)
-    out = []
-    reads = await db.inbox_reads.find({"user_id": user["id"]}, {"_id": 0, "doc_id": 1}).to_list(length=2000)
-    read_ids = {r["doc_id"] for r in reads}
-    async for d in cursor:
-        d = await _enrich_doc(d)
-        d["is_read"] = d["id"] in read_ids
-        out.append(d)
-    unread = sum(1 for x in out if not x["is_read"])
-    return {"items": out, "unread_count": unread}
+                        <div class="text-center">
+                            <p class="text-[10px] text-gray-400 font-semibold tracking-wider">RESEAU SECURISE - MINISTERIE DE L'INNOVATION</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
 
+        // Template HTML for MFA Strong Authentication Screen
+        function getMfaScreenHTML() {
+            return `
+                <div class="min-h-screen flex items-center justify-center p-4">
+                    <div class="max-w-md w-full glass-panel rounded-2xl p-8 shadow-2xl relative border border-emerald-900/10">
+                        <div class="absolute top-0 inset-x-0 h-2 bg-emerald-800"></div>
 
-@api.post("/inbox/{doc_id}/read")
-async def mark_inbox_read(doc_id: str, user: dict = Depends(current_user_dep)):
-    d = await db.documents.find_one({"id": doc_id, "is_deleted": False})
-    if not d or user["id"] not in d.get("shared_with", []):
-        raise HTTPException(status_code=404, detail="Élément introuvable")
-    await db.inbox_reads.update_one(
-        {"user_id": user["id"], "doc_id": doc_id},
-        {"$set": {"user_id": user["id"], "doc_id": doc_id, "read_at": now_iso()}},
-        upsert=True,
-    )
-    return {"message": "ok"}
+                        <div class="text-center mb-6">
+                            <div class="flex justify-center mb-3">
+                                <span class="p-3 bg-emerald-100 rounded-full text-emerald-800">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                                </span>
+                            </div>
+                            <span class="text-xs font-bold tracking-widest text-emerald-800 uppercase block">${State.customTitles.pays}</span>
+                            <h2 class="text-sm font-extrabold text-[#1A1A1A] uppercase tracking-tight leading-tight mt-1">${State.customTitles.ministre}</h2>
+                        </div>
 
+                        <div class="bg-gray-100/80 p-4 rounded-xl border border-gray-200 mb-6">
+                            <p class="text-xs text-gray-600 leading-relaxed text-center">
+                                Un jeton de validation temporaire a été envoyé sur l'appareil sécurisé de <br>
+                                <strong class="text-[#1A1A1A] block mt-1">${State.currentUser.name}</strong>
+                                <span class="text-[10px] font-bold text-emerald-800 block mt-1 tracking-wider">SÉCURISATION PAR JETON PHYSIQUE</span>
+                            </p>
+                        </div>
 
-# ===================== Announcements =====================
-@api.get("/announcements")
-async def list_announcements(user: dict = Depends(current_user_dep)):
-    now_str = now_iso()
-    cursor = db.announcements.find({
-        "$or": [{"expires_at": None}, {"expires_at": {"$gt": now_str}}]
-    }, {"_id": 0}).sort("created_at", -1)
-    return await cursor.to_list(length=100)
+                        <div class="mb-6">
+                            <label class="block text-xs font-bold text-gray-700 uppercase mb-2 text-center">Saisir le Code d'accès MFA à 4 Chiffres</label>
+                            <input type="text" id="mfa-input" placeholder="Ex: 1234" maxlength="4" class="w-full text-center py-3 text-2xl font-bold tracking-widest bg-white border border-gray-300 rounded-xl focus:ring-2 focus:ring-emerald-700 focus:outline-none" autofocus>
+                            <p class="text-[11px] text-gray-500 text-center mt-2">Saisir n'importe quelle clé pour simuler la validation (ex: 1234)</p>
+                        </div>
 
+                        <div class="space-y-3">
+                            <button id="verify-mfa-btn" class="w-full bg-emerald-800 text-white font-bold text-sm py-3 px-4 rounded-xl shadow-md hover:bg-emerald-900 transition-colors uppercase tracking-wider flex items-center justify-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.952 11.952 0 01-7.618 3.0167L3 5.671V11c0 5.523 4.477 10 10 10s10-4.477 10-10V5.671l-1.382-.687z" /></svg>
+                                Vérifier la Clé d'Accès
+                            </button>
+                            <button id="bypass-mfa-btn" class="w-full bg-emerald-100 text-emerald-800 border border-emerald-200 font-bold text-xs py-2 px-4 rounded-xl hover:bg-emerald-200 transition-colors flex items-center justify-center gap-2">
+                                ⚡ PASSER L'ÉTAPE MFA
+                            </button>
+                            <button id="logout-mfa-btn" class="w-full bg-white text-gray-700 border border-gray-300 font-bold text-xs py-2 px-4 rounded-xl hover:bg-gray-50 transition-colors">
+                                Retour à l'accueil
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
 
-@api.post("/announcements")
-async def create_announcement(body: AnnouncementCreate, user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    if not body.title.strip() or not body.content.strip():
-        raise HTTPException(status_code=400, detail="Titre et contenu requis")
-    a = {
-        "id": str(uuid.uuid4()),
-        "title": body.title,
-        "content": body.content,
-        "expires_at": body.expires_at,
-        "author_id": user["id"],
-        "author_name": user.get("name", ""),
-        "created_at": now_iso(),
-    }
-    await db.announcements.insert_one(a)
-    # Notify all active users (except the author)
-    cursor = db.users.find({"is_active": True}, {"_id": 1, "name": 1})
-    async for u in cursor:
-        uid = str(u["_id"])
-        if uid == user["id"]:
-            continue
-        await create_notification(
-            user_id=uid,
-            title="📢 " + body.title,
-            message=body.content[:140] + ("…" if len(body.content) > 140 else ""),
-            link="/",
-            actor_name=user.get("name", ""),
-        )
-    await log_activity(user["id"], user.get("name", ""), "announcement_created", f"Annonce: {body.title}", "announcement", a["id"])
-    a.pop("_id", None)
-    return a
+        // Template HTML for Sidebar (High Contrast Text and Colors)
+        function getSidebarHTML() {
+            // Options array to map navigation items
+            const menuItems = [
+                { id: 'dashboard', label: 'Tableau de Bord', icon: '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2H6a2 2 0 01-2-2v-4zM14 16a2 2 0 012-2h2a2 2 0 012 2v4a2 2 0 01-2 2h-2a2 2 0 01-2-2v-4z" /></svg>' },
+                { id: 'documents', label: 'Dossiers & Documents', icon: '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>', badge: 'GED' },
+                { id: 'messages', label: 'Messages Inter-Directions', icon: '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>', badge: 'Canal' },
+                { id: 'history', label: 'Historique & Audit', icon: '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>' },
+                { id: 'parameters', label: 'Paramètres de l\'Interface', icon: '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg>' }
+            ];
 
+            return `
+                <!-- Ministry Block in Sidebar -->
+                <div class="p-6 border-b border-gray-300 flex items-center gap-3">
+                    <img src="${State.logo}" alt="Logo" class="h-12 w-12 rounded-lg object-cover shadow-sm border border-emerald-950/20" id="sidebar-logo-img">
+                    <div>
+                        <h1 class="text-xs font-black text-[#000000] tracking-wider uppercase leading-tight">${State.customTitles.ministre}</h1>
+                        <p class="text-[10px] font-bold text-emerald-800 tracking-widest mt-0.5">${State.customTitles.pays}</p>
+                    </div>
+                </div>
 
-@api.delete("/announcements/{ann_id}")
-async def delete_announcement(ann_id: str, user: dict = Depends(current_user_dep)):
-    require_admin(user)
-    a = await db.announcements.find_one({"id": ann_id})
-    if not a:
-        raise HTTPException(status_code=404, detail="Annonce introuvable")
-    await db.announcements.delete_one({"id": ann_id})
-    return {"message": "Annonce supprimée"}
+                <!-- Logged In User profile banner -->
+                <div class="m-4 p-4 rounded-xl border border-gray-200 bg-white/50 flex flex-col items-center text-center shadow-sm">
+                    <div class="h-10 w-10 rounded-full bg-emerald-800 text-white font-black flex items-center justify-center text-sm mb-2 shadow-sm">
+                        ${State.currentUser.name.split(' ').map(p => p[0]).join('').substring(0, 2).toUpperCase()}
+                    </div>
+                    <div class="text-xs font-black text-[#1A1A1A]">${State.currentUser.name}</div>
+                    <div class="text-[10px] text-gray-500 font-medium">${State.currentUser.email}</div>
+                    <div class="mt-2 flex gap-1 justify-center">
+                        <span class="px-2 py-0.5 rounded text-[9px] font-bold tracking-wider bg-emerald-100 text-emerald-800 uppercase border border-emerald-200">
+                            ${State.currentUser.role}
+                        </span>
+                        <span class="px-2 py-0.5 rounded text-[9px] font-bold tracking-wider bg-gray-100 text-gray-700 uppercase border border-gray-200">
+                            RH-ACTIVE
+                        </span>
+                    </div>
+                </div>
 
+                <!-- Navigation List - STRICT HIGH CONTRAST (#000000 / #1A1A1A, Bold & Premium) -->
+                <div class="flex-1 px-3 space-y-1 overflow-y-auto">
+                    ${menuItems.map(item => `
+                        <button onclick="switchTab('${item.id}')" 
+                                class="w-full flex items-center justify-between px-4 py-3 rounded-xl transition-all duration-150 ${State.activeTab === item.id ? 'bg-emerald-800 text-white shadow-md' : 'text-[#000000] hover:text-[#000000] hover:bg-emerald-800/10'} group">
+                            <div class="flex items-center gap-3">
+                                <span class="${State.activeTab === item.id ? 'text-white' : 'text-[#1A1A1A] group-hover:text-emerald-800'} transition-colors">
+                                    ${item.icon}
+                                </span>
+                                <span class="text-sm font-bold tracking-tight">${item.label}</span>
+                            </div>
+                            ${item.badge ? `
+                                <span class="text-[10px] font-extrabold px-1.5 py-0.5 rounded-md ${State.activeTab === item.id ? 'bg-white/20 text-white' : 'bg-emerald-800 text-white'} uppercase">
+                                    ${item.badge}
+                                </span>
+                            ` : ''}
+                        </button>
+                    `).join('')}
+                </div>
 
-# ===================== Startup =====================
-@app.on_event("startup")
-async def on_startup():
-    # Indexes
-    await db.users.create_index("email", unique=True)
-    await db.folders.create_index("id", unique=True)
-    await db.documents.create_index("id", unique=True)
-    await db.documents.create_index("created_at")
-    await db.activity_logs.create_index("timestamp")
+                <!-- Quick local server controller widget inside sidebar for visibility -->
+                <div class="p-4 border-t border-gray-300">
+                    <div class="rounded-xl border border-gray-200 bg-white/60 p-3 flex flex-col shadow-sm">
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-[10px] font-black text-gray-500 uppercase tracking-wider">SERVEUR LOCAL</span>
+                            <div class="flex items-center gap-1.5">
+                                <span class="h-2 w-2 rounded-full ${State.localServer.status === 'online' ? 'bg-green-500 animate-pulse' : State.localServer.status === 'syncing' ? 'bg-yellow-500 animate-spin' : 'bg-red-500'}"></span>
+                                <span class="text-[10px] font-black uppercase text-gray-700">${State.localServer.status}</span>
+                            </div>
+                        </div>
+                        <button onclick="toggleLocalServer()" class="w-full text-center py-1.5 rounded-lg text-[10px] font-black tracking-wider uppercase border border-gray-300 bg-white hover:bg-gray-50 transition-colors shadow-sm">
+                            ${State.localServer.status === 'online' ? '🔴 Éteindre' : '🔌 Démarrer'}
+                        </button>
+                    </div>
+                </div>
 
-    # Seed admin
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@mhcged.cg").lower()
-    admin_password = os.environ.get("ADMIN_PASSWORD", "Admin@2026")
-    existing = await db.users.find_one({"email": admin_email})
-    if not existing:
-        await db.users.insert_one({
-            "email": admin_email,
-            "password_hash": hash_password(admin_password),
-            "name": "Administrateur MHCGED",
-            "role": "admin",
-            "is_active": True,
-            "created_at": now_iso(),
-        })
-        logger.info("Admin par défaut créé: %s", admin_email)
-    else:
-        if not verify_password(admin_password, existing["password_hash"]):
-            await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_password)}})
-            logger.info("Mot de passe admin resynchronisé")
+                <!-- Footer Section in Sidebar -->
+                <div class="p-4 border-t border-gray-300 bg-black/5 flex items-center justify-between">
+                    <button onclick="lockScreen()" class="p-2 text-[#1A1A1A] hover:text-emerald-800 hover:bg-white/50 rounded-lg transition-colors flex items-center gap-1 text-xs font-bold">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                        Verrouiller
+                    </button>
+                    <button onclick="logout()" class="p-2 text-red-700 hover:text-red-900 hover:bg-red-50 rounded-lg transition-colors flex items-center gap-1 text-xs font-bold">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+                        Déconnexion
+                    </button>
+                </div>
+            `;
+        }
 
-    # Initialize object storage
-    try:
-        storage.init_storage()
-    except Exception as e:
-        logger.error("Échec init storage: %s", e)
+        // Template HTML for Workspace Top Header
+        function getHeaderHTML() {
+            const today = new Date();
+            const formatTime = today.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+            return `
+                <header class="h-16 border-b border-gray-300 bg-white/70 backdrop-blur-sm flex items-center justify-between px-6">
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs font-black tracking-widest text-emerald-800 border-r border-gray-300 pr-3 uppercase">BRAZZAVILLE HQ</span>
+                        <h2 class="text-sm font-bold text-gray-700 uppercase tracking-tight hidden sm:block">${State.customTitles.main}</h2>
+                    </div>
+                    <div class="flex items-center gap-4">
+                        <!-- Clock and Status indicator -->
+                        <div class="flex items-center gap-2 text-xs font-bold text-gray-600 bg-gray-100 px-3 py-1.5 rounded-lg border border-gray-200">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-emerald-800" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                            <span>${formatTime} | UTC+1</span>
+                        </div>
+                        <div class="h-8 w-8 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-800 relative">
+                            <span class="absolute top-1 right-1 h-2 w-2 rounded-full bg-emerald-600"></span>
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 01-6 0v-1m6 0H9" /></svg>
+                        </div>
+                    </div>
+                </header>
+            `;
+        }
 
-    # Auto-archive old documents (>= ARCHIVE_AFTER_YEARS)
-    threshold = (datetime.now(timezone.utc) - timedelta(days=ARCHIVE_AFTER_YEARS * 365)).isoformat()
-    res = await db.documents.update_many(
-        {"is_archived": False, "is_deleted": False, "created_at": {"$lte": threshold}},
-        {"$set": {"is_archived": True, "archived_at": now_iso()}},
-    )
-    if res.modified_count:
-        logger.info("Auto-archivage: %d documents archivés", res.modified_count)
+        // Switch between major sections of app
+        function switchTab(tabId) {
+            State.activeTab = tabId;
+            renderApp();
+        }
 
+        // Return HTML based on active tab
+        function getMainContentHTML() {
+            switch(State.activeTab) {
+                case 'dashboard':
+                    return getDashboardTabHTML();
+                case 'documents':
+                    return getDocumentsTabHTML();
+                case 'messages':
+                    return getMessagesTabHTML();
+                case 'history':
+                    return getHistoryTabHTML();
+                case 'parameters':
+                    return getParametersTabHTML();
+                default:
+                    return getDashboardTabHTML();
+            }
+        }
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    client.close()
+        // HTML Template for Dashboard Home Tab
+        function getDashboardTabHTML() {
+            const rolePrivileges = {
+                'ADMIN': 'Accès root complet, journaux d\'audit globaux et paramètres d\'interface.',
+                'DSIC': 'Accès développement, gestion des documents techniques, administration système et synchronisation.',
+                'DIRECTION': 'Accès Haute Direction, signature électronique de décrets d\'exploitation et visas.'
+            };
 
+            return `
+                <div class="space-y-6">
+                    <!-- Welcome Panel -->
+                    <div class="bg-white/90 border border-gray-200 rounded-2xl p-6 shadow-sm relative overflow-hidden">
+                        <div class="absolute right-0 bottom-0 opacity-10 pointer-events-none transform translate-y-4">
+                            <img src="${State.logo}" alt="Sceau" class="h-44 w-44">
+                        </div>
+                        <span class="text-[10px] font-black tracking-widest text-emerald-800 uppercase bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-100">ESPACE ADMINISTRATIF CONSOLIDÉ</span>
+                        <h2 class="text-2xl font-black text-[#1A1A1A] mt-3">Bonjour, ${State.currentUser.name} !</h2>
+                        <p class="text-sm text-gray-600 mt-1.5 leading-relaxed max-w-2xl">
+                            Bienvenue sur le portail GED du <strong class="text-emerald-900">${State.customTitles.ministre}</strong>. Vous êtes connecté avec le rôle <strong>${State.currentUser.role}</strong>.
+                        </p>
+                        <div class="mt-4 p-3 bg-gray-50 rounded-xl border border-gray-200 text-xs font-medium text-gray-700 max-w-xl">
+                            💡 <strong class="text-emerald-900">Privilèges actifs :</strong> ${rolePrivileges[State.currentUser.role] || 'Accès standard.'}
+                        </div>
+                    </div>
 
-# Mount router + CORS
-app.include_router(api)
+                    <!-- Statistics grid row -->
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <!-- Total Files Card -->
+                        <div class="bg-white/90 border border-gray-200 rounded-2xl p-5 shadow-sm flex items-center gap-4">
+                            <div class="h-12 w-12 rounded-xl bg-emerald-100 text-emerald-800 flex items-center justify-center">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                            </div>
+                            <div>
+                                <h4 class="text-xs font-black text-gray-500 uppercase">Documents Archivés</h4>
+                                <div class="text-2xl font-black text-[#1A1A1A] mt-0.5">${State.documents.length} fichiers</div>
+                                <span class="text-[10px] font-bold text-emerald-700">Stockage cloud chiffré</span>
+                            </div>
+                        </div>
 
-_origins_raw = os.environ.get("CORS_ORIGINS", "*")
-_origins = [o.strip() for o in _origins_raw.split(",")] if _origins_raw else ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=_origins,
-    allow_origin_regex=".*",
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+                        <!-- Messages Card -->
+                        <div class="bg-white/90 border border-gray-200 rounded-2xl p-5 shadow-sm flex items-center gap-4">
+                            <div class="h-12 w-12 rounded-xl bg-indigo-100 text-indigo-800 flex items-center justify-center">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
+                            </div>
+                            <div>
+                                <h4 class="text-xs font-black text-gray-500 uppercase">Dépêches Inter-Directions</h4>
+                                <div class="text-2xl font-black text-[#1A1A1A] mt-0.5">${State.messages.length} messages</div>
+                                <span class="text-[10px] font-bold text-indigo-700">Canal interne crypté</span>
+                            </div>
+                        </div>
 
+                        <!-- Status Server Card -->
+                        <div class="bg-white/90 border border-gray-200 rounded-2xl p-5 shadow-sm flex items-center gap-4">
+                            <div class="h-12 w-12 rounded-xl ${State.localServer.status === 'online' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'} flex items-center justify-center">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" /></svg>
+                            </div>
+                            <div>
+                                <h4 class="text-xs font-black text-gray-500 uppercase">Base / Serveur Local</h4>
+                                <div class="text-xl font-black text-[#1A1A1A] mt-0.5 uppercase">${State.localServer.status === 'online' ? 'OPÉRATIONNEL' : 'ÉTEINT'}</div>
+                                <span class="text-[10px] font-bold text-gray-600">IP: ${State.localServer.ip}:${State.localServer.port}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- NEW : INTERACTIVE LOCAL SERVER MANAGEMENT COMPONENT -->
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <!-- Server Management Card -->
+                        <div class="bg-white/95 border border-gray-200 rounded-2xl p-6 shadow-sm lg:col-span-1 space-y-4">
+                            <div>
+                                <h3 class="text-base font-black text-[#1A1A1A]">Contrôleur de Serveur Local</h3>
+                                <p class="text-xs text-gray-500 mt-1">Gérer la liaison locale et l'archivage en miroir physique.</p>
+                            </div>
+
+                            <!-- Server status control board -->
+                            <div class="p-4 rounded-xl border border-gray-200 bg-gray-50 flex flex-col gap-3">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-xs font-bold text-gray-700">Statut Réseau :</span>
+                                    <span id="server-badge-ui" class="px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider ${State.localServer.status === 'online' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
+                                        ${State.localServer.status === 'online' ? 'Actif' : 'Arrêté'}
+                                    </span>
+                                </div>
+                                
+                                <div class="space-y-1.5">
+                                    <label class="block text-[10px] font-black text-gray-500 uppercase">Port de Communication</label>
+                                    <input type="text" id="server-port-input" value="${State.localServer.port}" class="w-full text-xs font-mono p-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-800 bg-white" placeholder="Ex: 8080" ${State.localServer.status === 'online' ? 'disabled' : ''}>
+                                </div>
+
+                                <div class="space-y-1.5">
+                                    <label class="block text-[10px] font-black text-gray-500 uppercase">IP Serveur</label>
+                                    <input type="text" id="server-ip-input" value="${State.localServer.ip}" class="w-full text-xs font-mono p-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-emerald-800 bg-white" placeholder="Ex: 127.0.0.1" ${State.localServer.status === 'online' ? 'disabled' : ''}>
+                                </div>
+                            </div>
+
+                            <div class="flex gap-2">
+                                <button onclick="toggleLocalServer()" class="flex-1 text-center py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider border border-gray-300 shadow-sm transition-colors ${State.localServer.status === 'online' ? 'bg-red-50 text-red-700 hover:bg-red-100 border-red-300' : 'bg-emerald-800 text-white hover:bg-emerald-900 border-emerald-900'}">
+                                    ${State.localServer.status === 'online' ? 'Arrêter le Serveur' : 'Lancer le Serveur'}
+                                </button>
+                                <button onclick="triggerLocalSync()" id="sync-server-btn" class="px-3 rounded-xl border border-gray-300 bg-white hover:bg-gray-50 text-[#1A1A1A] hover:text-emerald-800 transition-colors shadow-sm flex items-center justify-center" ${State.localServer.status === 'offline' ? 'disabled title="Démarrez d\'abord le serveur"' : ''}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 15h-.582m0 0H21m-21 0h5.582m0 0h-.582m0 0V9" /></svg>
+                                </button>
+                            </div>
+
+                            <!-- Sync progress bar -->
+                            <div id="sync-progress-container" class="hidden space-y-1">
+                                <div class="flex justify-between items-center">
+                                    <span class="text-[10px] font-black text-emerald-800 uppercase animate-pulse">Synchronisation miroir en cours...</span>
+                                    <span id="sync-percent-label" class="text-[10px] font-bold text-gray-700">0%</span>
+                                </div>
+                                <div class="w-full bg-gray-200 h-2 rounded-full overflow-hidden">
+                                    <div id="sync-progress-bar" class="bg-emerald-800 h-full w-0 transition-all duration-150"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Live Terminal Console Logs Card -->
+                        <div class="bg-gray-950 border border-gray-800 rounded-2xl p-6 shadow-lg lg:col-span-2 flex flex-col h-64 lg:h-auto">
+                            <div class="flex items-center justify-between mb-3 border-b border-gray-800 pb-2">
+                                <div class="flex items-center gap-2">
+                                    <span class="h-3 w-3 rounded-full bg-red-500"></span>
+                                    <span class="h-3 w-3 rounded-full bg-yellow-500"></span>
+                                    <span class="h-3 w-3 rounded-full bg-green-500"></span>
+                                    <span class="text-xs font-black text-gray-400 font-mono ml-2">CONCENTRATOR_MHC_LOCAL.log</span>
+                                </div>
+                                <button onclick="clearServerLogs()" class="text-[10px] font-mono text-gray-500 hover:text-gray-300 uppercase tracking-widest">Effacer</button>
+                            </div>
+                            <div id="terminal-logs" class="flex-1 font-mono text-xs text-green-400 overflow-y-auto space-y-1.5 p-2 bg-black/40 rounded-xl max-h-48 md:max-h-full">
+                                ${State.localServer.logs.map(log => `<div class="leading-relaxed opacity-90">${log}</div>`).join('')}
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Direct Access Quick Links Grid -->
+                    <div class="bg-white/90 border border-gray-200 rounded-2xl p-6 shadow-sm">
+                        <h3 class="text-base font-black text-[#1A1A1A] mb-4">Raccourcis Directs Système</h3>
+                        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                            <button onclick="switchTab('documents')" class="p-4 rounded-xl border border-gray-200 hover:border-emerald-700 bg-gray-50 hover:bg-emerald-50/20 text-center transition-all">
+                                <span class="block text-emerald-800 mb-2 justify-center flex">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
+                                </span>
+                                <span class="text-xs font-bold text-[#1A1A1A]">Nouveau Document</span>
+                            </button>
+                            <button onclick="switchTab('messages')" class="p-4 rounded-xl border border-gray-200 hover:border-emerald-700 bg-gray-50 hover:bg-emerald-50/20 text-center transition-all">
+                                <span class="block text-indigo-800 mb-2 justify-center flex">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
+                                </span>
+                                <span class="text-xs font-bold text-[#1A1A1A]">Envoyer Dépêche</span>
+                            </button>
+                            <button onclick="switchTab('parameters')" class="p-4 rounded-xl border border-gray-200 hover:border-emerald-700 bg-gray-50 hover:bg-emerald-50/20 text-center transition-all">
+                                <span class="block text-amber-700 mb-2 justify-center flex">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                                </span>
+                                <span class="text-xs font-bold text-[#1A1A1A]">Titres & Visuels</span>
+                            </button>
+                            <button onclick="switchTab('history')" class="p-4 rounded-xl border border-gray-200 hover:border-emerald-700 bg-gray-50 hover:bg-emerald-50/20 text-center transition-all">
+                                <span class="block text-gray-700 mb-2 justify-center flex">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" /></svg>
+                                </span>
+                                <span class="text-xs font-bold text-[#1A1A1A]">Piste d'Audit</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // HTML Template for "Dossiers & Documents" Tab
+        function getDocumentsTabHTML() {
+            return `
+                <div class="space-y-6">
+                    <!-- Section title -->
+                    <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                        <div>
+                            <h2 class="text-xl font-black text-[#1A1A1A]">Registre des Documents National</h2>
+                            <p class="text-xs text-gray-500 mt-1">Consulter, importer ou lire les dossiers de forage et d'exploitation du Ministère.</p>
+                        </div>
+                        
+                        <!-- Upload Input integration -->
+                        <div class="flex items-center gap-2">
+                            <label class="cursor-pointer bg-emerald-800 text-white font-bold text-xs py-2.5 px-4 rounded-xl hover:bg-emerald-900 transition-all flex items-center gap-2 shadow-sm hover:shadow-md">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                                Importer depuis l'ordinateur
+                                <input type="file" id="local-file-uploader" class="hidden" accept=".pdf,.doc,.docx" onchange="handleLocalFileUpload(event)">
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- File search/filter bar -->
+                    <div class="bg-white/80 border border-gray-200 rounded-xl p-3 flex flex-col sm:flex-row gap-3">
+                        <div class="flex-1 relative">
+                            <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400 pointer-events-none">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                            </span>
+                            <input type="text" placeholder="Rechercher un dossier ministériel..." class="w-full bg-white pl-9 pr-4 py-2 border border-gray-300 rounded-lg text-xs font-semibold text-[#1A1A1A] focus:outline-none focus:ring-1 focus:ring-emerald-800">
+                        </div>
+                    </div>
+
+                    <!-- Grid of file records -->
+                    <div class="bg-white/90 border border-gray-200 rounded-2xl overflow-hidden shadow-sm">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead>
+                                    <tr class="bg-gray-100 border-b border-gray-200">
+                                        <th class="p-4 text-xs font-black text-gray-500 uppercase">Intitulé du Fichier</th>
+                                        <th class="p-4 text-xs font-black text-gray-500 uppercase">Catégorie</th>
+                                        <th class="p-4 text-xs font-black text-gray-500 uppercase">Auteur</th>
+                                        <th class="p-4 text-xs font-black text-gray-500 uppercase">Date d'archivage</th>
+                                        <th class="p-4 text-xs font-black text-gray-500 uppercase">Taille</th>
+                                        <th class="p-4 text-xs font-black text-gray-500 uppercase text-right">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-gray-200 text-xs font-medium">
+                                    ${State.documents.map(doc => `
+                                        <tr class="hover:bg-gray-50/50 transition-colors">
+                                            <td class="p-4 flex items-center gap-2.5">
+                                                <span class="text-red-700">
+                                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" /></svg>
+                                                </span>
+                                                <div>
+                                                    <span class="font-bold text-[#1A1A1A] block">${doc.name}</span>
+                                                    <span class="text-[10px] text-gray-400 font-mono">ID: REF-00${doc.id}</span>
+                                                </div>
+                                            </td>
+                                            <td class="p-4 text-gray-600">${doc.category}</td>
+                                            <td class="p-4">
+                                                <span class="px-2 py-0.5 rounded bg-gray-100 border border-gray-200 text-gray-700 font-bold uppercase tracking-wider text-[10px]">
+                                                    ${doc.creator}
+                                                </span>
+                                            </td>
+                                            <td class="p-4 text-gray-500">${doc.date}</td>
+                                            <td class="p-4 font-mono text-gray-600">${doc.size}</td>
+                                            <td class="p-4 text-right space-x-1">
+                                                <button onclick="openPdfViewer(${doc.id})" class="inline-flex items-center gap-1.5 bg-emerald-100 hover:bg-emerald-200 text-emerald-800 font-bold text-[10px] px-3 py-1.5 rounded-lg border border-emerald-200 uppercase transition-all shadow-sm">
+                                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                                                    Visualiser (PDF)
+                                                </button>
+                                                <button onclick="downloadFakeDocument('${doc.name}')" class="inline-flex items-center gap-1.5 bg-white hover:bg-gray-100 text-gray-700 font-bold text-[10px] px-3 py-1.5 rounded-lg border border-gray-300 uppercase transition-all shadow-sm">
+                                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4-4v12" /></svg>
+                                                    Télécharger
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Simulate a complete and secure local file uploader
+        function handleLocalFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            // Generate size formatted string
+            const sizeString = file.size > 1024 * 1024 
+                ? (file.size / (1024 * 1024)).toFixed(1) + ' Mo' 
+                : (file.size / 1024).toFixed(0) + ' Ko';
+
+            const today = new Date();
+            const dateStr = today.toLocaleDateString('fr-FR');
+
+            // Creating the mock document entry
+            const newDoc = {
+                id: State.documents.length + 1,
+                name: file.name,
+                size: sizeString,
+                date: dateStr,
+                category: "Import Externe",
+                creator: State.currentUser.role,
+                content: `REPUBLIQUE DU CONGO\nMINISTERE DES HYDROCARBURES\n\nDOCUMENT TELEVERSE EN LOCAL\nFichier : ${file.name}\nDate d'importation : ${dateStr} à ${today.toLocaleTimeString('fr-FR')}\n\nCe document a été importé avec succès depuis l'ordinateur par l'utilisateur ${State.currentUser.name} (${State.currentUser.role}).\n\nLe chiffrement AES-256 a été appliqué en local sur les disques de l'administration du Cabinet.`
+            };
+
+            // Push and log action in terminal
+            State.documents.push(newDoc);
+            
+            const logEntry = `[GED] Fichier '${file.name}' importé avec succès (${sizeString}). Chiffrement local appliqué.`;
+            State.localServer.logs.push(logEntry);
+            State.systemLogs.unshift({
+                id: State.systemLogs.length + 1,
+                action: `Importation locale du document : ${file.name}`,
+                user: State.currentUser.role,
+                date: `${dateStr} ${today.toLocaleTimeString('fr-FR')}`,
+                ip: State.localServer.ip
+            });
+
+            saveStateToStorage();
+            showLocalNotification(`Le document "${file.name}" a été importé avec succès !`);
+            renderApp();
+        }
+
+        // HTML Template for "Messages Inter-Directions" Tab
+        function getMessagesTabHTML() {
+            return `
+                <div class="space-y-6">
+                    <div>
+                        <h2 class="text-xl font-black text-[#1A1A1A]">Dépêches Inter-Directions</h2>
+                        <p class="text-xs text-gray-500 mt-1">Canal de transmission ultra-sécurisé du cabinet ministériel.</p>
+                    </div>
+
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <!-- Left Panel: Department Directory -->
+                        <div class="bg-white/90 border border-gray-200 rounded-2xl p-5 shadow-sm space-y-4">
+                            <h4 class="text-xs font-black text-[#1A1A1A] uppercase tracking-wider">Membres Actifs du Cabinet</h4>
+                            <div class="space-y-2">
+                                ${State.accounts.map(acc => `
+                                    <div class="p-3 rounded-xl border border-gray-100 bg-gray-50 flex items-center justify-between">
+                                        <div>
+                                            <div class="text-xs font-black text-[#1A1A1A]">${acc.name}</div>
+                                            <div class="text-[10px] text-gray-500">${acc.role} - ${acc.service}</div>
+                                        </div>
+                                        <span class="h-2.5 w-2.5 rounded-full bg-green-500 border border-white"></span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+
+                        <!-- Right Panel: Message Exchange Sandbox -->
+                        <div class="lg:col-span-2 bg-white/90 border border-gray-200 rounded-2xl flex flex-col h-[500px] shadow-sm overflow-hidden">
+                            <!-- Exchange Header -->
+                            <div class="p-4 border-b border-gray-200 bg-gray-50 flex items-center gap-2">
+                                <span class="h-2 w-2 rounded-full bg-emerald-600"></span>
+                                <span class="text-xs font-black text-[#1A1A1A] uppercase tracking-wider">Canal Central Crypté</span>
+                            </div>
+
+                            <!-- Messages Stream Box -->
+                            <div class="flex-1 p-4 overflow-y-auto space-y-4 bg-gray-50/50" id="messages-container">
+                                ${State.messages.map(msg => `
+                                    <div class="flex flex-col ${msg.role === State.currentUser.role ? 'items-end' : 'items-start'}">
+                                        <div class="text-[10px] text-gray-500 font-bold mb-1 flex gap-2 items-center">
+                                            <span>${msg.sender} (${msg.role})</span>
+                                            <span>•</span>
+                                            <span>${msg.time}</span>
+                                        </div>
+                                        <div class="p-3 rounded-2xl text-xs leading-relaxed max-w-sm shadow-sm border ${msg.role === State.currentUser.role ? 'bg-emerald-800 text-white border-emerald-900 rounded-tr-none' : 'bg-white text-gray-800 border-gray-200 rounded-tl-none'}">
+                                            ${msg.text}
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+
+                            <!-- User Input Area -->
+                            <div class="p-4 border-t border-gray-200 bg-white flex gap-2 items-center">
+                                <input type="text" id="chat-input" placeholder="Rédiger une dépêche ministérielle..." class="flex-1 bg-gray-100 border border-gray-300 rounded-xl px-4 py-2.5 text-xs font-medium focus:outline-none focus:ring-1 focus:ring-emerald-800 text-[#1A1A1A]">
+                                <button onclick="sendCabinetMessage()" class="bg-emerald-800 hover:bg-emerald-900 text-white font-bold text-xs py-2.5 px-5 rounded-xl transition-colors shadow-sm flex items-center gap-1">
+                                    Transmettre
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Append a message to the simulated server log and dashboard chat
+        function sendCabinetMessage() {
+            const input = document.getElementById('chat-input');
+            if (!input || !input.value.trim()) return;
+
+            const text = input.value.trim();
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+            const newMsg = {
+                sender: State.currentUser.name,
+                role: State.currentUser.role,
+                text: text,
+                time: timeStr
+            };
+
+            State.messages.push(newMsg);
+            
+            // Log this messaging interaction
+            State.localServer.logs.push(`[MESSAGERIE] Dépêche cryptée transmise de ${State.currentUser.role}.`);
+            saveStateToStorage();
+            input.value = '';
+            renderApp();
+
+            // Scroll container to bottom
+            const container = document.getElementById('messages-container');
+            if (container) {
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        // HTML Template for "Historique & Audit" Tab
+        function getHistoryTabHTML() {
+            return `
+                <div class="space-y-6">
+                    <div>
+                        <h2 class="text-xl font-black text-[#1A1A1A]">Registre d'Audit & Historique</h2>
+                        <p class="text-xs text-gray-500 mt-1">Traçabilité complète des accès aux serveurs physiques du Ministère.</p>
+                    </div>
+
+                    <div class="bg-white/90 border border-gray-200 rounded-2xl overflow-hidden shadow-sm">
+                        <table class="w-full text-left border-collapse text-xs font-medium">
+                            <thead>
+                                <tr class="bg-gray-100 border-b border-gray-200">
+                                    <th class="p-4 text-xs font-black text-gray-500 uppercase">Horodatage précis</th>
+                                    <th class="p-4 text-xs font-black text-gray-500 uppercase">Activité / Log</th>
+                                    <th class="p-4 text-xs font-black text-gray-500 uppercase">Intervenant</th>
+                                    <th class="p-4 text-xs font-black text-gray-500 uppercase">Adresse IP de Session</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-200">
+                                ${State.systemLogs.map(log => `
+                                    <tr class="hover:bg-gray-50/50 transition-colors">
+                                        <td class="p-4 text-gray-500 font-mono">${log.date}</td>
+                                        <td class="p-4 font-bold text-[#1A1A1A]">${log.action}</td>
+                                        <td class="p-4">
+                                            <span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider bg-emerald-100 text-emerald-800">
+                                                ${log.user}
+                                            </span>
+                                        </td>
+                                        <td class="p-4 text-gray-600 font-mono">${log.ip}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        // HTML Template for Interface & Title configuration
+        function getParametersTabHTML() {
+            const activeUserAccounts = State.accounts;
+            return `
+                <div class="space-y-6">
+                    <div>
+                        <h2 class="text-xl font-black text-[#1A1A1A]">Paramètres Généraux de l'Interface</h2>
+                        <p class="text-xs text-gray-500 mt-1">Personnaliser l'identité visuelle de votre portail GED pour le Ministère.</p>
+                    </div>
+
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <!-- Column 1: Titles and Customizations -->
+                        <div class="bg-white/90 border border-gray-200 rounded-2xl p-6 shadow-sm space-y-5">
+                            <h3 class="text-base font-black text-[#1A1A1A]">Configuration des Titres de l'App</h3>
+                            
+                            <div class="space-y-4">
+                                <div class="space-y-1.5">
+                                    <label class="block text-xs font-bold text-gray-700 uppercase">Titre Principal de l'Application</label>
+                                    <input type="text" id="param-title-main" value="${State.customTitles.main}" class="w-full text-xs font-semibold p-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-800 bg-white text-[#1A1A1A]">
+                                </div>
+
+                                <div class="space-y-1.5">
+                                    <label class="block text-xs font-bold text-gray-700 uppercase">Nom du Ministère officiel</label>
+                                    <input type="text" id="param-title-ministre" value="${State.customTitles.ministre}" class="w-full text-xs font-semibold p-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-800 bg-white text-[#1A1A1A]">
+                                </div>
+
+                                <div class="space-y-1.5">
+                                    <label class="block text-xs font-bold text-gray-700 uppercase">Pays / Nation</label>
+                                    <input type="text" id="param-title-pays" value="${State.customTitles.pays}" class="w-full text-xs font-semibold p-3 border border-gray-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-800 bg-white text-[#1A1A1A]">
+                                </div>
+                            </div>
+
+                            <button onclick="saveCustomTitles()" class="w-full bg-emerald-800 hover:bg-emerald-900 text-white font-bold text-xs py-3 px-4 rounded-xl shadow-md transition-colors uppercase tracking-wider">
+                                Mettre à jour les titres officiels
+                            </button>
+                        </div>
+
+                        <!-- Custom Image / Wallpaper selection panel -->
+                        <div class="bg-white/90 border border-gray-200 rounded-2xl p-6 shadow-sm space-y-5">
+                            <h3 class="text-base font-black text-[#1A1A1A]">Arrière-plan (Wallpaper) de l'Application</h3>
+                            <p class="text-xs text-gray-500">Choisir une teinte prédéfinie ou charger une image personnalisée pour le fond d'écran.</p>
+
+                            <div class="space-y-4">
+                                <div class="grid grid-cols-3 gap-3">
+                                    <!-- Off white preset button -->
+                                    <button onclick="setWallpaperColor('#F4F2EB')" class="p-3 rounded-xl border border-gray-200 bg-[#F4F2EB] text-xs font-bold text-gray-800 shadow-sm flex flex-col items-center justify-center hover:scale-105 transition-transform">
+                                        <span class="h-5 w-5 rounded-full bg-[#F4F2EB] border border-gray-300 mb-1"></span>
+                                        Blanc Cassé
+                                    </button>
+                                    <!-- Soft light green preset button -->
+                                    <button onclick="setWallpaperColor('#E1ECE6')" class="p-3 rounded-xl border border-gray-200 bg-[#E1ECE6] text-xs font-bold text-gray-800 shadow-sm flex flex-col items-center justify-center hover:scale-105 transition-transform">
+                                        <span class="h-5 w-5 rounded-full bg-[#E1ECE6] border border-gray-300 mb-1"></span>
+                                        Vert Serein
+                                    </button>
+                                    <!-- Soft cream beige preset button -->
+                                    <button onclick="setWallpaperColor('#FAF8F3')" class="p-3 rounded-xl border border-gray-200 bg-[#FAF8F3] text-xs font-bold text-gray-800 shadow-sm flex flex-col items-center justify-center hover:scale-105 transition-transform">
+                                        <span class="h-5 w-5 rounded-full bg-[#FAF8F3] border border-gray-300 mb-1"></span>
+                                        Beige Sablé
+                                    </button>
+                                </div>
+
+                                <div class="border-t border-gray-200 pt-4">
+                                    <label class="block text-xs font-bold text-gray-700 uppercase mb-2">Importer une image de fond personnalisée</label>
+                                    <label class="cursor-pointer block text-center p-4 border-2 border-dashed border-gray-300 hover:border-emerald-700 rounded-xl bg-gray-50 hover:bg-emerald-50/10 transition-colors">
+                                        <span class="text-xs font-bold text-[#1A1A1A] block">📁 Téléverser une image (.png, .jpg)</span>
+                                        <span class="text-[10px] text-gray-400 mt-0.5 block">Recommandé : 1920x1080px</span>
+                                        <input type="file" id="wallpaper-uploader" class="hidden" accept="image/*" onchange="handleWallpaperUpload(event)">
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Column 2: Logo and Accounts modification -->
+                        <div class="bg-white/90 border border-gray-200 rounded-2xl p-6 shadow-sm space-y-5">
+                            <h3 class="text-base font-black text-[#1A1A1A]">Identité Visuelle (Logo)</h3>
+                            <p class="text-xs text-gray-500">Modifier l'armoirie officielle affichée en haut du menu et à la connexion.</p>
+
+                            <div class="flex flex-col sm:flex-row items-center gap-5">
+                                <img src="${State.logo}" alt="Sceau Officiel" class="h-20 w-20 rounded-xl border border-gray-200 object-cover shadow-sm" id="params-logo-preview">
+                                <div class="flex-1 w-full space-y-2">
+                                    <label class="cursor-pointer block text-center py-2.5 px-4 bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-xl text-xs font-bold text-gray-800 transition-colors shadow-sm">
+                                        Téléverser Sceau Officiel
+                                        <input type="file" id="logo-uploader" class="hidden" accept="image/*" onchange="handleLogoUpload(event)">
+                                    </label>
+                                    <p class="text-[10px] text-gray-400 text-center sm:text-left leading-relaxed">Les modifications sont sauvegardées instantanément dans le cache sécurisé local.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- User Profiles Access management -->
+                        <div class="bg-white/90 border border-gray-200 rounded-2xl p-6 shadow-sm space-y-5">
+                            <div class="flex items-center justify-between">
+                                <h3 class="text-base font-black text-[#1A1A1A]">Gestion des Comptes & Droits</h3>
+                                <span class="px-2 py-0.5 rounded text-[10px] bg-emerald-100 text-emerald-800 font-extrabold uppercase tracking-wider">Habilitation</span>
+                            </div>
+
+                            <div class="space-y-3">
+                                ${activeUserAccounts.map((acc, index) => `
+                                    <div class="p-3 rounded-xl border border-gray-100 bg-gray-50 flex flex-col gap-2.5 shadow-sm">
+                                        <div class="flex items-center justify-between">
+                                            <span class="text-xs font-bold text-[#1A1A1A]">${acc.name}</span>
+                                            <span class="text-[10px] font-mono text-gray-400">REF-${index + 1}</span>
+                                        </div>
+                                        <div class="grid grid-cols-2 gap-2">
+                                            <input type="text" value="${acc.name}" onchange="updateAccountInfo(${index}, 'name', this.value)" class="text-[11px] p-2 bg-white border border-gray-300 rounded-lg text-gray-800" placeholder="Nom complet">
+                                            <input type="text" value="${acc.email}" onchange="updateAccountInfo(${index}, 'email', this.value)" class="text-[11px] p-2 bg-white border border-gray-300 rounded-lg text-gray-800" placeholder="E-mail">
+                                        </div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Custom logo uploader logic
+        function handleLogoUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                State.logo = e.target.result;
+                saveStateToStorage();
+                showLocalNotification("Logo mis à jour avec succès.");
+                renderApp();
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // Custom wallpaper uploader logic
+        function handleWallpaperUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                State.wallpaper.type = 'image';
+                State.wallpaper.value = e.target.result;
+                saveStateToStorage();
+                showLocalNotification("Image de fond d'écran configurée.");
+                renderApp();
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // Set quick background color
+        function setWallpaperColor(colorValue) {
+            State.wallpaper.type = 'color';
+            State.wallpaper.value = colorValue;
+            saveStateToStorage();
+            showLocalNotification(`Arrière-plan changé pour la couleur prédéfinie.`);
+            renderApp();
+        }
+
+        // Update titles dynamic trigger
+        function saveCustomTitles() {
+            const main = document.getElementById('param-title-main').value;
+            const ministre = document.getElementById('param-title-ministre').value;
+            const pays = document.getElementById('param-title-pays').value;
+
+            if (main.trim() && ministre.trim() && pays.trim()) {
+                State.customTitles.main = main.trim();
+                State.customTitles.ministre = ministre.trim().toUpperCase();
+                State.customTitles.pays = pays.trim().toUpperCase();
+
+                saveStateToStorage();
+                showLocalNotification("Les titres de l'application ont été mis à jour.");
+                renderApp();
+            }
+        }
+
+        // Fast update accounts fields
+        function updateAccountInfo(index, field, value) {
+            if (State.accounts[index]) {
+                State.accounts[index][field] = value.trim();
+                saveStateToStorage();
+            }
+        }
+
+        // Toggle Local Server status
+        function toggleLocalServer() {
+            const isOnline = State.localServer.status === 'online';
+            
+            // If turning on, capture IP and port inputs if present
+            if (!isOnline) {
+                const portInput = document.getElementById('server-port-input');
+                const ipInput = document.getElementById('server-ip-input');
+                if (portInput && portInput.value.trim()) State.localServer.port = portInput.value.trim();
+                if (ipInput && ipInput.value.trim()) State.localServer.ip = ipInput.value.trim();
+                
+                State.localServer.status = 'online';
+                State.localServer.logs.push(`[SYSTEM] Serveur local initialisé sur http://${State.localServer.ip}:${State.localServer.port}`);
+                State.localServer.logs.push(`[DB] Base de données PostgreSQL locale synchronisée.`);
+            } else {
+                State.localServer.status = 'offline';
+                State.localServer.logs.push(`[SYSTEM] Fermeture propre des services et déconnexion.`);
+            }
+
+            saveStateToStorage();
+            renderApp();
+            
+            // Auto scroll logs console to bottom
+            const term = document.getElementById('terminal-logs');
+            if (term) term.scrollTop = term.scrollHeight;
+        }
+
+        // Simulated Sync process with live loading progress
+        function triggerLocalSync() {
+            if (State.localServer.status !== 'online') return;
+
+            const progressContainer = document.getElementById('sync-progress-container');
+            const progressBar = document.getElementById('sync-progress-bar');
+            const percentLabel = document.getElementById('sync-percent-label');
+            const syncBtn = document.getElementById('sync-server-btn');
+
+            if (!progressContainer || !progressBar || !percentLabel || !syncBtn) return;
+
+            // Start Sync animation
+            syncBtn.disabled = true;
+            progressContainer.classList.remove('hidden');
+            State.localServer.status = 'syncing';
+            
+            State.localServer.logs.push(`[SYNC] Lancement de l'archivage miroir sécurisé...`);
+            let progress = 0;
+
+            const interval = setInterval(() => {
+                progress += Math.floor(Math.random() * 15) + 5;
+                if (progress >= 100) {
+                    progress = 100;
+                    clearInterval(interval);
+
+                    // Finalize sync State
+                    State.localServer.status = 'online';
+                    syncBtn.disabled = false;
+                    setTimeout(() => {
+                        progressContainer.classList.add('hidden');
+                    }, 1000);
+
+                    // Add log entries
+                    const syncDateStr = new Date().toLocaleString('fr-FR');
+                    State.localServer.logs.push(`[SYNC SUCCESS] Base locale conforme à 100%. (${syncDateStr})`);
+                    State.localServer.logs.push(`[ARCHIVE] Transfert des fichiers récents vers le miroir : OK.`);
+                    
+                    saveStateToStorage();
+                    renderApp();
+                }
+
+                // Update UI elements smoothly
+                progressBar.style.width = `${progress}%`;
+                percentLabel.textContent = `${progress}%`;
+            }, 250);
+        }
+
+        function clearServerLogs() {
+            State.localServer.logs = [`[SYSTÈME] Console vidée par l'administrateur.`];
+            saveStateToStorage();
+            renderApp();
+        }
+
+        // HTML Template for Integrated PDF Viewer Modal
+        function getPdfViewerModalHTML() {
+            if (!State.pdfViewer.isOpen || !State.pdfViewer.document) return '';
+
+            const doc = State.pdfViewer.document;
+            return `
+                <div class="fixed inset-0 z-50 overflow-hidden bg-black/60 flex items-center justify-center p-4">
+                    <div class="bg-zinc-800 text-white rounded-2xl w-full max-w-4xl h-[90vh] flex flex-col shadow-2xl relative">
+                        <!-- Top Toolbar of PDF Reader -->
+                        <div class="p-4 border-b border-zinc-700 bg-zinc-900 flex flex-wrap items-center justify-between gap-3 rounded-t-2xl">
+                            <div class="flex items-center gap-3">
+                                <span class="p-2 bg-red-600 rounded text-white font-black text-xs">PDF</span>
+                                <div>
+                                    <h3 class="text-xs font-bold leading-tight truncate max-w-xs md:max-w-md">${doc.name}</h3>
+                                    <p class="text-[10px] text-zinc-400 mt-0.5">Sceau d'Authentification Ministérielle Actif</p>
+                                </div>
+                            </div>
+                            
+                            <!-- PDF Zoom & Readout tools -->
+                            <div class="flex items-center gap-2 bg-zinc-800 px-3 py-1.5 rounded-lg border border-zinc-700">
+                                <button onclick="zoomPdf(-10)" class="text-zinc-400 hover:text-white p-1 transition-colors">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 12H4" /></svg>
+                                </button>
+                                <span class="text-xs font-bold font-mono tracking-wider px-2" id="pdf-zoom-val">${State.pdfViewer.zoom}%</span>
+                                <button onclick="zoomPdf(10)" class="text-zinc-400 hover:text-white p-1 transition-colors">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>
+                                </button>
+                            </div>
+
+                            <button onclick="closePdfViewer()" class="p-2 text-zinc-400 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+
+                        <!-- Main PDF simulated canvas scrollable area -->
+                        <div class="flex-1 overflow-auto p-8 bg-zinc-900/60 flex justify-center">
+                            <div class="bg-white text-[#1A1A1A] w-[210mm] min-h-[297mm] p-12 md:p-16 shadow-lg rounded-md origin-top transition-transform relative border border-gray-300" 
+                                 style="transform: scale(${State.pdfViewer.zoom / 100});" 
+                                 id="pdf-rendered-page">
+                                
+                                <!-- Official Header Block of simulated document -->
+                                <div class="flex items-start justify-between border-b-2 border-emerald-800 pb-4 mb-8">
+                                    <div>
+                                        <h1 class="text-xs font-black tracking-widest text-emerald-800 uppercase leading-snug">${State.customTitles.pays}</h1>
+                                        <p class="text-[9px] font-bold text-gray-500 uppercase tracking-widest mt-0.5">${State.customTitles.ministre}</p>
+                                    </div>
+                                    <img src="${State.logo}" alt="Sceau" class="h-12 w-12 object-cover">
+                                </div>
+
+                                <!-- Watermark watermark stamps of officiality -->
+                                <div class="absolute inset-0 flex items-center justify-center opacity-[0.03] pointer-events-none select-none">
+                                    <img src="${State.logo}" alt="Sceau Filigrane" class="w-80 h-80 object-cover">
+                                </div>
+
+                                <!-- Official PDF Document Content -->
+                                <div class="whitespace-pre-line text-xs leading-relaxed font-serif text-justify" id="pdf-text-container">
+                                    ${doc.content}
+                                </div>
+
+                                <!-- Signature block in doc -->
+                                <div class="mt-16 border-t border-dashed border-gray-300 pt-6 flex justify-end">
+                                    <div class="text-center w-64">
+                                        <p class="text-[9px] text-gray-400 font-bold uppercase tracking-wider">Visa Direction Générale</p>
+                                        <div class="h-10 my-1 font-mono text-xs text-emerald-800 flex items-center justify-center font-bold tracking-wider italic">
+                                            [ APPROUVÉ PAR SÉCURITÉ MFA ]
+                                        </div>
+                                        <p class="text-[10px] text-emerald-900 font-bold uppercase">${State.currentUser.name}</p>
+                                        <p class="text-[8px] text-gray-500 font-medium">Archivé le ${doc.date}</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Bottom status info -->
+                        <div class="p-3 border-t border-zinc-700 bg-zinc-950 text-[10px] text-zinc-400 font-mono flex items-center justify-between">
+                            <span>SÉCURISATION : CLÉ_SHA256_ACTIVE</span>
+                            <span>PAGE 1 / 1</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // PDF Visualizer state controls
+        function openPdfViewer(documentId) {
+            const documentFound = State.documents.find(d => d.id === documentId);
+            if (!documentFound) return;
+
+            State.pdfViewer.document = documentFound;
+            State.pdfViewer.isOpen = true;
+            State.pdfViewer.zoom = 100;
+
+            // Log reading activity
+            const todayStr = new Date().toLocaleString('fr-FR');
+            State.systemLogs.unshift({
+                id: State.systemLogs.length + 1,
+                action: `Consultation intégrée du document : ${documentFound.name}`,
+                user: State.currentUser.role,
+                date: todayStr,
+                ip: State.localServer.ip
+            });
+
+            saveStateToStorage();
+            renderApp();
+        }
+
+        function closePdfViewer() {
+            State.pdfViewer.isOpen = false;
+            State.pdfViewer.document = null;
+            renderApp();
+        }
+
+        function zoomPdf(val) {
+            const newZoom = State.pdfViewer.zoom + val;
+            if (newZoom >= 50 && newZoom <= 150) {
+                State.pdfViewer.zoom = newZoom;
+                const page = document.getElementById('pdf-rendered-page');
+                const zoomVal = document.getElementById('pdf-zoom-val');
+                if (page) page.style.transform = `scale(${newZoom / 100})`;
+                if (zoomVal) zoomVal.textContent = `${newZoom}%`;
+            }
+        }
+
+        function downloadFakeDocument(docName) {
+            showLocalNotification(`Téléchargement de "${docName}" lancé vers votre ordinateur.`);
+        }
+
+        // Profile quick select & auto launch MFA validation
+        function selectProfileAndConnect(profileId) {
+            const account = State.accounts.find(a => a.id === profileId);
+            if (!account) return;
+
+            State.currentUser = account;
+            State.mfaPassed = false;
+            
+            saveStateToStorage();
+            renderApp();
+        }
+
+        function verifyMfaCode() {
+            const mfaInput = document.getElementById('mfa-input');
+            if (mfaInput) {
+                // Accepts any mock verification code for seamless local preview flow
+                State.mfaPassed = true;
+                
+                // Add initial logs entry on successful entry
+                const todayStr = new Date().toLocaleString('fr-FR');
+                State.localServer.logs.push(`[CONNEXION] Session initiée pour ${State.currentUser.name} (${State.currentUser.role}).`);
+                State.systemLogs.unshift({
+                    id: State.systemLogs.length + 1,
+                    action: "Session authentifiée via clé forte MFA",
+                    user: State.currentUser.role,
+                    date: todayStr,
+                    ip: State.localServer.ip
+                });
+
+                saveStateToStorage();
+                renderApp();
+                showLocalNotification(`Bienvenue, authentification forte réussie !`);
+            }
+        }
+
+        function bypassMfa() {
+            State.mfaPassed = true;
+            const todayStr = new Date().toLocaleString('fr-FR');
+            State.localServer.logs.push(`[CONNEXION] Session initiée (Contournement MFA) pour ${State.currentUser.name}.`);
+            saveStateToStorage();
+            renderApp();
+        }
+
+        function logout() {
+            if (State.currentUser) {
+                State.localServer.logs.push(`[DECONNEXION] Session clôturée pour ${State.currentUser.name}.`);
+            }
+            State.currentUser = null;
+            State.mfaPassed = false;
+            saveStateToStorage();
+            renderApp();
+        }
+
+        function lockScreen() {
+            State.mfaPassed = false;
+            saveStateToStorage();
+            renderApp();
+        }
+
+        // Attach DOM Events to dynamic elements safely
+        function attachLoginScreenEvents() {
+            // Unneeded since clicks use inline handlers
+        }
+
+        function attachMfaScreenEvents() {
+            const verifyBtn = document.getElementById('verify-mfa-btn');
+            const bypassBtn = document.getElementById('bypass-mfa-btn');
+            const logoutBtn = document.getElementById('logout-mfa-btn');
+            const mfaInput = document.getElementById('mfa-input');
+
+            if (verifyBtn) verifyBtn.addEventListener('click', verifyMfaCode);
+            if (bypassBtn) bypassBtn.addEventListener('click', bypassMfa);
+            if (logoutBtn) logoutBtn.addEventListener('click', logout);
+            
+            // Allow press Enter to validate
+            if (mfaInput) {
+                mfaInput.addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') verifyMfaCode();
+                });
+            }
+        }
+
+        function attachDashboardEvents() {
+            // Auto scroll of chats if on messages tab
+            if (State.activeTab === 'messages') {
+                const container = document.getElementById('messages-container');
+                if (container) container.scrollTop = container.scrollHeight;
+                
+                // Press Enter to send message
+                const chatInput = document.getElementById('chat-input');
+                if (chatInput) {
+                    chatInput.addEventListener('keypress', function(e) {
+                        if (e.key === 'Enter') sendCabinetMessage();
+                    });
+                }
+            }
+        }
+
+        function attachPdfViewerEvents() {
+            // Handled inside zoom buttons directly
+        }
+
+        // Modern custom notifications (Replacing standard alerts)
+        function showLocalNotification(text) {
+            // Remove preexisting toast
+            const oldToast = document.getElementById('system-toast-notif');
+            if (oldToast) oldToast.remove();
+
+            // Create container
+            const toast = document.createElement('div');
+            toast.id = 'system-toast-notif';
+            toast.className = 'fixed bottom-5 right-5 z-50 p-4 bg-emerald-900 text-white rounded-xl shadow-2xl flex items-center gap-3 border border-emerald-800 transition-all transform translate-y-10 opacity-0 max-w-sm';
+            toast.innerHTML = `
+                <div class="h-6 w-6 rounded-full bg-emerald-800 flex items-center justify-center text-white text-xs">✓</div>
+                <div class="text-xs font-bold leading-normal">${text}</div>
+            `;
+
+            document.body.appendChild(toast);
+
+            // Animate In
+            setTimeout(() => {
+                toast.classList.remove('translate-y-10', 'opacity-0');
+                toast.classList.add('translate-y-0', 'opacity-100');
+            }, 100);
+
+            // Animate Out
+            setTimeout(() => {
+                toast.classList.add('translate-y-10', 'opacity-0');
+                setTimeout(() => toast.remove(), 500);
+            }, 4000);
+        }
+
+        // Final Mount of App Root
+        window.onload = function() {
+            setTimeout(() => {
+                renderApp();
+            }, 1000); // Elegant fake splash delay for load simulation
+        }
+    </script>
+</body>
+</html>
